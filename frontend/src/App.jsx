@@ -1,18 +1,44 @@
 import { useEffect, useState } from "react";
+import CandleChart from "./components/CandleChart";
+import { getTicker } from "./lib/api";
 
-const API_URL = import.meta.env.VITE_API_URL;
+const SYMBOL = "BTCUSDT";
 
 export default function App() {
-  const [status, setStatus] = useState("loading");
+  const [ticker, setTicker] = useState(null);
 
   useEffect(() => {
-    fetch(`${API_URL}/health`)
-      .then((res) => res.json())
-      .then((data) => setStatus(data.status))
-      // Sin este catch, un fallo de CORS deja la promesa rechazada en silencio
-      // y la UI se queda en "loading" para siempre sin ninguna pista.
-      .catch(() => setStatus("unreachable"));
+    let cancelled = false;
+
+    const load = () =>
+      getTicker(SYMBOL)
+        .then((data) => {
+          if (!cancelled) setTicker(data);
+        })
+        .catch(console.error);
+
+    load();
+    const timer = setInterval(load, 10_000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
   }, []);
 
-  return <h1>Backend: {status}</h1>;
+  const up = ticker && ticker.price_change_percent >= 0;
+
+  return (
+    <div style={{ padding: 24, minHeight: "100vh", background: "#131722", color: "#d1d4dc" }}>
+      <h1 style={{ fontSize: 20, fontWeight: 500 }}>
+        {SYMBOL}{" "}
+        {ticker && (
+          <span style={{ color: up ? "#26a69a" : "#ef5350" }}>
+            {ticker.last_price} ({ticker.price_change_percent}%)
+          </span>
+        )}
+      </h1>
+      <CandleChart symbol={SYMBOL} interval="1m" />
+    </div>
+  );
 }

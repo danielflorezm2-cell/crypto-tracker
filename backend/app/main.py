@@ -1,10 +1,11 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
+from app.api.market import router as market_router
 from app.core.config import settings
 
-app = FastAPI(title="Crypto Tracker API")
 
+app = FastAPI(title="Crypto Tracker API")
+app.include_router(market_router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins_list,
