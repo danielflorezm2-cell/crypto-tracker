@@ -20,21 +20,27 @@ export default function CandleChart({ symbol = "BTCUSDT", interval = "1m" }) {
     // Evita que un fetch en vuelo escriba sobre un chart ya destruido
     let cancelled = false;
     let timer = null;
-
+    let lastTime = null;
     getKlines(symbol, interval, 500)
       .then((candles) => {
         if (cancelled) return;
         series.setData(candles);
+        lastTime = candles[candles.length - 1].time;
+        console.log(lastTime);
+        console.log(candles[candles.length - 1].time);
 
         timer = setInterval(() => {
           getKlines(symbol, interval, 2)
             .then((latest) => {
               if (cancelled) return;
-              // update() reemplaza si el timestamp ya existe y añade si es
-              // nuevo. Por eso la vela en curso se redibuja en su sitio
-              // en vez de duplicarse, y sin resetear zoom ni scroll.
-              latest.forEach((candle) => series.update(candle));
-            })
+                latest.forEach((candle) => {
+                    // update() no acepta retroceder en el tiempo: la vela anterior
+                    // ya está en la serie salvo justo al cruzar el cambio de minuto
+                    if (candle.time < lastTime) return;
+                    series.update(candle);
+                    lastTime = candle.time;
+                    })
+                })
             .catch(console.error);
         }, REFRESH_MS);
       })
