@@ -1,13 +1,9 @@
-const BASE = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
-
 async function get(path, params) {
-  const url = new URL(path, BASE);
-  url.search = new URLSearchParams(params).toString();
+  const query = new URLSearchParams(params).toString();
 
-  const response = await fetch(url);
+  // Sin host: la URL es relativa al propio Vite, que hace de intermediario.
+  const response = await fetch(`${path}?${query}`);
 
-  // fetch NO lanza en 4xx/5xx: solo falla si la red se cae. Sin este check,
-  // un 429 de Binance llegaría a la UI como si fuera JSON válido.
   if (!response.ok) {
     throw new Error(`${response.status} ${await response.text()}`);
   }

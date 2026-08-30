@@ -7,6 +7,8 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:?falta en .env}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?falta en .env}
       POSTGRES_DB: ${POSTGRES_DB:?falta en .env}
+      CORS_ORIGINS: ${CORS_ORIGINS:?falta en .env}
+      BINANCE_REST_URL: ${BINANCE_REST_URL:?falta en .env}
     ports:
       - "${POSTGRES_PORT}:5432"
     volumes:

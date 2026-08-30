@@ -3,6 +3,7 @@ import { createChart, CandlestickSeries } from "lightweight-charts";
 import { getKlines } from "../lib/api";
 
 const REFRESH_MS = 10_000;
+const COLOMBIA_OFFSET = 5 * 60 * 60;
 
 export default function CandleChart({ symbol = "BTCUSDT", interval = "1m" }) {
   const containerRef = useRef(null);
