@@ -23,6 +23,7 @@ services:
     environment:
       CORS_ORIGINS: ${CORS_ORIGINS:?falta en .env}
       BINANCE_REST_URL: ${BINANCE_REST_URL:?falta en .env}
+      DATABASE_URL: ${DATABASE_URL:?falta en .env}
     ports:
       - "${BACKEND_PORT}:8000"
     volumes:
