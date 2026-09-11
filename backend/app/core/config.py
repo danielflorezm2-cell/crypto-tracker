@@ -1,8 +1,8 @@
-from pydantic_settings import BaseSettings, ConfigDict
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = ConfigDict(extra="ignore")
+    model_config = SettingsConfigDict(extra="ignore")
     cors_origins: str = "http://localhost:5173"
     binance_rest_url: str = "https://data-api.binance.vision"
     binance_api_key: str = ""
