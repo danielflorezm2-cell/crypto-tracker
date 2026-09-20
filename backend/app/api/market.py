@@ -1,7 +1,7 @@
 import httpx
 from fastapi import APIRouter, HTTPException, Query
 
-from app.api.schemas import Candle, Ticker
+from app.api.schemas import CandleOut, Ticker
 from app.core.config import settings
 
 router = APIRouter(prefix="/api", tags=["market"])
@@ -23,7 +23,7 @@ async def _binance_get(path: str, params: dict):
     return response.json()
 
 
-@router.get("/klines", response_model=list[Candle])
+@router.get("/klines", response_model=list[CandleOut])
 async def get_klines(
     symbol: str = "BTCUSDT",
     interval: str = "1m",
@@ -34,7 +34,7 @@ async def get_klines(
         {"symbol": symbol, "interval": interval, "limit": limit},
     )
     return [
-        Candle(
+        CandleOut(
             time=row[0] // 1000,
             open=row[1],
             high=row[2],

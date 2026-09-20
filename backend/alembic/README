@@ -1,1 +1,3 @@
 Generic single-database configuration.
+
+btree (symbol, "interval", open_time). Postgres puso interval entre comillas porque es el nombre de un tipo nativo. SQLAlchemy lo maneja solo, pero el día que escribas SQL a mano —y el ON CONFLICT es un buen candidato— vas a tener que comillarlo vos. Si te olvidás, el error va a ser confuso, porque Postgres va a intentar leerlo como tipo y no como columna.

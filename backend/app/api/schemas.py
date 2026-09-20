@@ -1,7 +1,7 @@
 from pydantic import BaseModel
 
 
-class Candle(BaseModel):
+class CandleOut(BaseModel):
     # segundos UNIX, no milisegundos: es lo que espera lightweight-charts
     time: int
     open: float
