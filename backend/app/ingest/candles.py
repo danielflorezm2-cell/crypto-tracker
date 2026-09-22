@@ -74,7 +74,36 @@ def upsert_candles(rows: list[dict]) -> int:
     return len(rows)
 
 
-def ingest_latest(symbol: str = "BTCUSDT", interval: str = "1m", limit: int = 500, **params) -> int:
+def ingest_latest(symbol: str = "BTCUSDT", interval: str = "1m", limit: int = 500) -> int:
     raw = fetch_klines(symbol, interval, limit)
     # La última vela del array siempre es la en curso cuando pedimos hasta el presente
     return upsert_candles(to_rows(symbol, interval, raw[:-1]))
+
+def backfill(symbol: str, interval: str, start: datetime, page_size: int = 1000) -> int:
+    if start.tzinfo is None:
+        raise ValueError("start debe tener timezone; usá tzinfo=timezone.utc")
+
+    start_ms = int(start.timestamp() * 1000)
+    end_time = None
+    total = 0
+
+    while True:
+        params = {"endTime": end_time} if end_time is not None else {}
+        raw = fetch_klines(symbol, interval, page_size, **params)
+        if not raw:
+            break  # no hay más historia hacia atrás
+
+        oldest = raw[0][0]
+
+        # Solo la primera página llega al presente y trae la vela en curso
+        if end_time is None:
+            raw = raw[:-1]
+
+        rows = [r for r in raw if r[0] >= start_ms]
+        total += upsert_candles(to_rows(symbol, interval, rows))
+
+        if oldest <= start_ms:
+            break
+        end_time = oldest - 1
+
+    return total
