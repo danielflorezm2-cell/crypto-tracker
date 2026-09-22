@@ -2,24 +2,37 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 import httpx
+import time
 from sqlalchemy.dialects.postgresql import insert
 
 from app.core.config import settings
 from app.db.models import Candle
 from app.db.session import SessionLocal
 
+
 TIMEOUT = 10.0
+MAX_RETRIES = 5
+BASE_DELAY = 1.0
 
+def fetch_klines(symbol: str, interval: str, limit: int = 500, **params) -> list[list]:
+    query = {"symbol": symbol, "interval": interval, "limit": limit, **params}
 
-def fetch_klines(symbol: str, interval: str, limit: int = 500) -> list[list]:
     with httpx.Client(base_url=settings.binance_rest_url, timeout=TIMEOUT) as client:
-        response = client.get(
-            "/api/v3/klines",
-            params={"symbol": symbol, "interval": interval, "limit": limit},
-        )
-    response.raise_for_status()
-    return response.json()
+        for attempt in range(MAX_RETRIES):
+            response = client.get("/api/v3/klines", params=query)
 
+            if response.status_code not in (429,418):
+                response.raise_for_status()
+                return response.json()
+
+            # Binance dice cuánto esperar; su número gana sobre nuestro cálculo
+            retry_after = response.headers.get("Retry-After")
+            delay = float(retry_after) if retry_after else BASE_DELAY * (2 ** attempt)
+
+            print(f"{response.status_code} recibido, esperando {delay}s (intento {attempt + 1}/{MAX_RETRIES})")
+            time.sleep(delay)
+
+    raise RuntimeError(f"Binance sigue rechazando después de {MAX_RETRIES} intentos")
 
 def to_rows(symbol: str, interval: str, raw: list[list]) -> list[dict]:
     return [
@@ -61,7 +74,7 @@ def upsert_candles(rows: list[dict]) -> int:
     return len(rows)
 
 
-def ingest_latest(symbol: str = "BTCUSDT", interval: str = "1m", limit: int = 500) -> int:
+def ingest_latest(symbol: str = "BTCUSDT", interval: str = "1m", limit: int = 500, **params) -> int:
     raw = fetch_klines(symbol, interval, limit)
     # La última vela del array siempre es la en curso cuando pedimos hasta el presente
     return upsert_candles(to_rows(symbol, interval, raw[:-1]))
