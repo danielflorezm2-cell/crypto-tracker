@@ -29,8 +29,11 @@ def fetch_klines(symbol: str, interval: str, limit: int = 500, **params) -> list
             retry_after = response.headers.get("Retry-After")
             delay = float(retry_after) if retry_after else BASE_DELAY * (2 ** attempt)
 
-            print(f"{response.status_code} recibido, esperando {delay}s (intento {attempt + 1}/{MAX_RETRIES})")
-            time.sleep(delay)
+            print(f"{response.status_code} recibido (intento {attempt + 1}/{MAX_RETRIES})")
+            # Tras el último intento no hay a qué esperar: el raise de abajo es seguro
+            if attempt < MAX_RETRIES - 1:
+                print(f"esperando {delay}s")
+                time.sleep(delay)
 
     raise RuntimeError(f"Binance sigue rechazando después de {MAX_RETRIES} intentos")
 
