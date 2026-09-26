@@ -53,7 +53,7 @@ def get_klines(
                 volume=float(c.volume),
             )
             for c in reversed(candles)
-        ]
+        ]   
 
 @router.get("/ticker", response_model=Ticker)
 async def get_ticker(symbol: str = "BTCUSDT"):
