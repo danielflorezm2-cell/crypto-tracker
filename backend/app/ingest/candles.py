@@ -21,7 +21,13 @@ def fetch_klines(symbol: str, interval: str, limit: int = 500, **params) -> list
         for attempt in range(MAX_RETRIES):
             response = client.get("/api/v3/klines", params=query)
 
-            if response.status_code not in (429,418):
+            if response.status_code == 418:
+                # Un baneo puede durar horas: mejor fallar y que decida quien llama
+                raise RuntimeError(
+                    f"IP baneada por Binance; Retry-After={response.headers.get('Retry-After')}s"
+                )
+
+            if response.status_code != 429:
                 response.raise_for_status()
                 return response.json()
 
