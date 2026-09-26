@@ -37,16 +37,18 @@ Por eso se prefiere el código mínimo que resuelve la fase actual, sin abstracc
 | `backfill` paginando hacia atrás con `endTime` | ✅ | `backend/app/ingest/candles.py` |
 | `/api/klines` lee de Postgres (sync) | ✅ | `backend/app/api/market.py` |
 | `/api/ticker` sigue siendo proxy directo a Binance (async) | ✅ a propósito | `backend/app/api/market.py` |
-| Algo que ejecute la ingesta periódicamente | ❌ | — |
+| Gráfico tolera la tabla vacía (aviso + reintenta la carga completa) | ✅ | `frontend/src/components/CandleChart.jsx` |
+| Dependencias de base de datos fijadas (`alembic`, `SQLAlchemy`, `psycopg`) | ✅ | `backend/requirements.txt` |
 | Tests | ❌ (carpeta `backend/tests/` vacía) | — |
 
 ## 3. Pendientes inmediatos
 
-1. **Nadie alimenta la tabla de forma continua.** `/api/klines` ya lee de Postgres, pero
-   la ingesta solo corre a mano. Sin eso, el refresco de 10 s del frontend repite datos
-   viejos. Decidir el mecanismo provisional hasta que llegue Airflow (fase 4).
-2. **Criterio de cierre de la fase 2:** ingesta periódica + backfill probado + API leyendo
-   de Postgres + README al día.
+1. **Criterio de cierre de la fase 2:** backfill probado + API leyendo de Postgres +
+   README al día.
+2. **La ingesta periódica no es de esta fase.** Se corre a mano a propósito; la
+   automatiza Airflow en la fase 4, sin mecanismo provisional (ni cron ni scheduler en
+   FastAPI). Mientras tanto, el refresco de 10 s del frontend solo muestra velas nuevas si
+   se ingirió a mano entre refresco y refresco.
 
 ## 4. Dudas abiertas y discrepancias conocidas
 
@@ -55,8 +57,10 @@ Por eso se prefiere el código mínimo que resuelve la fase actual, sin abstracc
 - **Un `httpx.Client` nuevo por página** en `fetch_klines`: en un backfill largo no se
   reutilizan conexiones.
 - **`print` en lugar de `logging`** en la ingesta.
-- **Con la tabla vacía el gráfico no se recupera:** `CandleChart` falla al leer la última
-  vela de `[]` y no arranca el refresco hasta recargar la página.
+- **El intervalo está fijo en `App.jsx`** (`interval="1m"`). Se probaron `1m`, `5m` y
+  `15m` cambiándolo a mano; el gráfico solo muestra los intervalos que se hayan ingerido.
+- **`ingest_latest` descarta la vela en curso**, así que el refresco nunca pinta la vela
+  abierta: el gráfico avanza de a una vela cerrada por ingesta.
 - `airflow/dags/` y `backend/tests/` existen localmente pero están vacías (git no las
   versiona).
 
@@ -69,12 +73,15 @@ make migrate
 cd frontend && npm install && npm run dev
 ```
 
-Ejecutar la ingesta a mano (desde la raíz del repo):
+Ejecutar la ingesta a mano (desde la raíz del repo; `interval` por defecto es `"1m"`):
 
 ```bash
 docker compose exec backend python -c \
-  "from app.ingest.candles import ingest_latest; print(ingest_latest())"
+  "from app.ingest.candles import ingest_latest; print(ingest_latest(interval='1m'))"
 ```
+
+Si se cambió `requirements.txt`, reconstruir la imagen del backend antes de probar
+(`make up` **no** reconstruye): `docker compose up -d --build backend`.
 
 Recordatorios que muerden: Compose se ejecuta **siempre desde la raíz** (ver `README.md`
 §5); Postgres se expone en el host en `localhost:5433`; Alembic corre **dentro** del

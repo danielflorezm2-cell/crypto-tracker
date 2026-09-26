@@ -113,3 +113,25 @@ vela Binance → Postgres → gráfico y nuevas filas en el registro de decision
 **Aprendido:** Si `candles` está vacía, `CandleChart` falla al leer la última vela de `[]`
 y no arranca el refresco; hay que ingerir y recargar.
 **Siguiente:** Ingesta periódica; decidir si `418` corta la ingesta.
+
+### 2026-09-26 — Gráfico con tabla vacía, intervalos y dependencias fijadas
+
+**Hecho:** `CandleChart.jsx` reescrito con una sola función `load` que se llama al montar
+y cada 10 s: mientras `lastTime` es `null` pide la carga completa (500 velas) y, cuando
+ya hay historia, solo las 2 últimas (`7ff3a33`). Si `/api/klines` devuelve `[]` se
+muestra "No candles for … yet" encima del gráfico. Se quita la constante
+`COLOMBIA_OFFSET` y los `console.log` sobrantes. Se probó el gráfico con intervalos
+`1m`, `5m` y `15m` cambiando el prop en `App.jsx`; queda en `1m` (`9107dba`).
+`requirements.txt`: se elimina el `pydantic-settings==2.15.0` duplicado y se fijan
+`alembic`, `SQLAlchemy`, `psycopg` y `psycopg-binary` a versión exacta (`b9fc78a`).
+`README.md` al día: flujo de carga inicial con tabla vacía, se elimina la limitación
+"con la tabla vacía el gráfico no se recupera", aviso de que `make up` no reconstruye la
+imagen y cómo ver otros intervalos.
+**Problemas:** Resuelve lo anotado en la entrada anterior: con la tabla vacía el gráfico
+ya no se queda muerto; se recupera solo en el siguiente tick, sin recargar la página.
+**Aprendido:** El intervalo del gráfico tiene que coincidir con uno ya ingerido; si no,
+la tabla no tiene filas para ese `interval` y se ve el aviso de vacío.
+**Decisiones:** La ingesta periódica sale de la fase 2: es trabajo de Airflow en la fase 4
+y no se monta ningún mecanismo provisional mientras tanto. Corrige el "Siguiente" de las
+entradas anteriores de 2026-09-26, que la ponían como pendiente de esta fase.
+**Siguiente:** Decidir si `418` corta la ingesta; probar el backfill para cerrar la fase 2.

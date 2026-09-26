@@ -11,8 +11,8 @@ Por eso el código busca ser el mínimo que resuelve la fase actual, sin capas n
 
 > **Estado:** fase 2 (PostgreSQL e ingesta idempotente) en curso. Ya están la tabla
 > `candles`, el upsert idempotente, el backfill paginado con reintentos ante `429`/`418` y
-> `/api/klines` leyendo de Postgres. Falta que algo ejecute la ingesta de forma periódica:
-> hoy se corre a mano.
+> `/api/klines` leyendo de Postgres. La ingesta se corre a mano a propósito: ejecutarla de
+> forma periódica es trabajo de Airflow en la fase 4.
 
 **Documentos de trabajo**
 
@@ -75,7 +75,9 @@ Binance banea el polling agresivo.
    la vela en curso, convierten cada fila a `Decimal` y `datetime` UTC y hacen upsert en
    `candles`.
 2. **Carga inicial.** `CandleChart` pide `GET /api/klines?symbol=BTCUSDT&interval=1m&limit=500`
-   y pasa el resultado a `series.setData()`.
+   y pasa el resultado a `series.setData()`. Si llega `[]` (tabla vacía para ese
+   `interval`) muestra "No candles for … yet" y repite la carga completa en cada refresco
+   hasta que haya datos; no hace falta recargar la página.
 3. **Lectura.** `get_klines` hace un `SELECT` ordenado por `open_time DESC` con `LIMIT`
    (para quedarse con las más recientes), invierte el resultado a orden ascendente (lo exige
    lightweight-charts) y convierte cada fila a `CandleOut`: `open_time` pasa a **segundos
@@ -230,10 +232,7 @@ petición durante un baneo lo prolonga (escala de 2 min a 3 días).
 4. **El ticker no tiene caché.** Cada pestaña abierta multiplica las llamadas a Binance.
 5. **El frontend pide `limit=2` en cada refresco** para cubrir el cruce de minuto: si entre
    dos refrescos se cierra una vela, la anterior llega completa y la nueva empieza.
-6. **Con la tabla vacía el gráfico no se recupera.** `/api/klines` devuelve `[]`, el
-   componente falla al leer la última vela y no arranca el refresco. Hay que correr la
-   ingesta y recargar la página.
-7. **La ingesta usa `print`**, no `logging`.
+6. **La ingesta usa `print`**, no `logging`.
 
 ---
 
@@ -262,6 +261,9 @@ propios. Los guardas `${VAR:?falta en .env}` convierten ese error en un fallo vi
 | `make migrate` | `alembic upgrade head` dentro del contenedor `backend` |
 | `make revision m="mensaje"` | Genera una migración con `--autogenerate` |
 
+`make up` **no reconstruye** la imagen del backend. Después de cambiar
+`backend/requirements.txt` o el `Dockerfile`: `docker compose up -d --build backend`.
+
 Alembic corre **dentro** del contenedor porque `DATABASE_URL` apunta a `postgres:5432`, el
 nombre del servicio en la red de Compose. Desde el host, Postgres se expone en
 `localhost:${POSTGRES_PORT}` (5433 por defecto, para no chocar con un Postgres local).
@@ -282,6 +284,10 @@ docker compose exec backend python -c \
 ```
 
 Ambas devuelven cuántas filas se enviaron al upsert. Correrlas dos veces no duplica nada.
+
+El gráfico pide `interval="1m"` (fijo en `App.jsx`). Para ver `5m` o `15m` hay que ingerir
+ese intervalo (`ingest_latest(interval='5m')`) y cambiar el prop; si no, se ve el aviso de
+tabla vacía.
 
 ### Frontend
 
@@ -383,9 +389,9 @@ Cada fase queda funcionando de punta a punta antes de pasar a la siguiente.
 |---|---|---|
 | 0 — Andamiaje | Monorepo, Compose con Postgres, `/health`, CORS, variables de entorno | ✅ |
 | 1 — Rebanada vertical | Proxy a klines y ticker, velas en React con refresco de 10 s | ✅ |
-| 2 — PostgreSQL | Tabla `candles` ✅, upsert idempotente ✅, backfill paginado ✅, API lee de Postgres ✅, ingesta periódica ⏳ | 🚧 |
+| 2 — PostgreSQL | Tabla `candles` ✅, upsert idempotente ✅, backfill paginado ✅, API lee de Postgres ✅ | 🚧 |
 | 3 — Redis y tiempo real | 3a: polling a Redis con TTL (cache-aside). 3b: WebSocket de Binance → Pub/Sub → WebSocket de FastAPI | ⏳ |
-| 4 — Airflow | DAG incremental diario y DAG de backfill con `catchup=True` (ZIP de `data.binance.vision`) | ⏳ |
+| 4 — Airflow | Ingesta periódica: DAG incremental diario y DAG de backfill con `catchup=True` (ZIP de `data.binance.vision`) | ⏳ |
 | 5 — MongoDB | Snapshots de order book y alertas/watchlists, con justificación frente a Postgres | ⏳ |
 | 6 — Proyecto real | pytest, JWT, CI en GitHub Actions, Prometheus + Grafana, deploy | ⏳ |
 
