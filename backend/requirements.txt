@@ -6,7 +6,6 @@ httpcore==1.0.9
 httpx==0.28.1
 idna==3.19
 pydantic==2.13.4
-pydantic-settings==2.15.0
 pydantic_core==2.46.4
 python-dotenv==1.2.3
 typing-inspection==0.4.4
@@ -14,6 +13,7 @@ typing_extensions==4.16.0
 fastapi==0.115.*
 uvicorn[standard]==0.32.*
 pydantic-settings==2.*
-alembic
-sqlalchemy
-psycopg[binary]
+alembic==1.20.0
+psycopg==3.3.5
+psycopg-binary==3.3.5
+SQLAlchemy==2.0.54
