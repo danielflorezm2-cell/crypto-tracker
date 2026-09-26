@@ -11,7 +11,8 @@ psql:
 	$(COMPOSE) exec -it postgres psql -U $(POSTGRES_USER) -d $(POSTGRES_DB)
 migrate:
 	$(COMPOSE) exec backend alembic upgrade head
-
+redis:
+	$(COMPOSE) exec -it redis redis-cli
 # uso: make revision m="create candles table"
 revision:
 	$(COMPOSE) exec backend alembic revision --autogenerate -m "$(m)"

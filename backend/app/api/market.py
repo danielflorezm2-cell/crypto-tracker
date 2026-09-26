@@ -1,9 +1,10 @@
-import httpx
+import json
+
 from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import select
 
 from app.api.schemas import CandleOut, Ticker
-from app.core.config import settings
+from app.db.cache import cache, ticker_key
 from app.db.models import Candle
 from app.db.session import SessionLocal
 
@@ -13,18 +14,13 @@ router = APIRouter(prefix="/api", tags=["market"])
 TIMEOUT = 10.0
 
 
-async def _binance_get(path: str, params: dict):
-    async with httpx.AsyncClient(
-        base_url=settings.binance_rest_url, timeout=TIMEOUT
-    ) as client:
-        response = await client.get(path, params=params)
-
-    # Propagamos el status de Binance tal cual. Un 429 o un 418 tienen que
-    # llegar al navegador como 429 o 418, no disfrazados de 500 genérico.
-    if response.is_error:
-        raise HTTPException(status_code=response.status_code, detail=response.text)
-
-    return response.json()
+@router.get("/ticker", response_model=Ticker)
+def get_ticker(symbol: str = "BTCUSDT"):
+    raw = cache.get(ticker_key(symbol))
+    # Sin clave: el worker está caído, atrasado o no sigue este símbolo
+    if raw is None:
+        raise HTTPException(status_code=503, detail=f"No recent ticker for {symbol}")
+    return Ticker(**json.loads(raw))
 
 
 @router.get("/klines", response_model=list[CandleOut])

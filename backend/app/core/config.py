@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     binance_rest_url: str = "https://data-api.binance.vision"
     binance_api_key: str = ""
     database_url: str
+    redis_url: str
     @property
     def cors_origins_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",")]
