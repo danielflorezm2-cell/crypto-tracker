@@ -9,25 +9,40 @@ de datos.** No es un proyecto de producción: no hay usuarios, ni SLA, ni dinero
 Por eso el código busca ser el mínimo que resuelve la fase actual, sin capas ni abstracciones
 "por si acaso".
 
-> **Estado:** fase 1 (rebanada vertical sin persistencia) terminada. Fase 2 (PostgreSQL e
-> ingesta idempotente) en curso: el modelo `candles`, la sesión de SQLAlchemy y Alembic ya
-> están; la ingesta y la lectura desde Postgres todavía no.
+> **Estado:** fase 2 (PostgreSQL e ingesta idempotente) en curso. Ya están la tabla
+> `candles`, el upsert idempotente, el backfill paginado con reintentos ante `429`/`418` y
+> `/api/klines` leyendo de Postgres. Falta que algo ejecute la ingesta de forma periódica:
+> hoy se corre a mano.
+
+**Documentos de trabajo**
+
+| Archivo | Para qué |
+|---|---|
+| `README.md` | Documentación estable: arquitectura, puesta en marcha, convenciones y decisiones. |
+| [`CONTEXTO.md`](CONTEXTO.md) | Estado actual, pendientes y dudas abiertas. Se reescribe. |
+| [`BITACORA.md`](BITACORA.md) | Historia del trabajo, sesión por sesión. Append-only. |
 
 ---
 
 ## 1. Arquitectura y flujo de datos
 
-### Hoy (fase 1)
+### Hoy (fase 2 en curso)
 
 ```
-React (Vite :5173) ──GET /api/klines, /api/ticker──> Proxy de Vite ──> FastAPI (:8000)
-       ▲                                                                   │
-       │                                                                   v
-       └──── JSON (Candle[], Ticker) <──── Pydantic <──── HTTPX async ──> data-api.binance.vision
+                    ┌── GET /api/klines ──> FastAPI (:8000) ──SELECT──> PostgreSQL
+React (Vite :5173) ─┤   (proxy de Vite)                                     ▲
+                    └── GET /api/ticker ──> FastAPI ──HTTPX async──> Binance │
+                                                                             │ upsert
+ app.ingest.candles (a mano) ──HTTPX sync──> data-api.binance.vision ────────┘
 ```
 
-FastAPI actúa como **proxy**: recibe la petición, llama a Binance, convierte la respuesta a
-los esquemas de `app/api/schemas.py` y la devuelve. No hay base de datos en el camino.
+Hay dos caminos:
+
+- **Velas:** se leen de PostgreSQL. La tabla se llena con la ingesta (`app/ingest/`), que
+  pide velas a Binance y las guarda con un upsert idempotente. **La API ya no llama a
+  Binance para velas.**
+- **Ticker:** sigue siendo un proxy directo a Binance. Se deja así a propósito: es un solo
+  dato vivo que no vale la pena persistir; la fase 3 lo pasará a Redis.
 
 ### Objetivo (fases 2–5)
 
@@ -47,27 +62,31 @@ Binance banea el polling agresivo.
 |---|---|---|
 | Frontend | `frontend/src/` | `App.jsx` muestra el ticker; `CandleChart.jsx` pinta velas y refresca cada 10 s. |
 | Cliente HTTP (front) | `frontend/src/lib/api.js` | `fetch` con URL relativa: Vite hace de intermediario, así no hay CORS en desarrollo. |
-| API | `backend/app/api/market.py` | Endpoints `/api/klines` y `/api/ticker`; proxy a Binance con HTTPX. |
-| Esquemas | `backend/app/api/schemas.py` | Pydantic: `Candle` y `Ticker`, el contrato con el frontend. |
+| API | `backend/app/api/market.py` | `/api/klines` lee de Postgres; `/api/ticker` hace proxy a Binance con HTTPX. |
+| Esquemas | `backend/app/api/schemas.py` | Pydantic: `CandleOut` y `Ticker`, el contrato con el frontend. |
 | Configuración | `backend/app/core/config.py` | `Settings` desde variables de entorno (pydantic-settings). |
-| Base de datos | `backend/app/db/` | `models.py` (tabla `candles`) y `session.py` (engine + `SessionLocal`). |
-| Ingesta | `backend/app/ingest/` | *Vacío por ahora.* Aquí vivirá la lógica de backfill, importable por Airflow. |
+| Base de datos | `backend/app/db/` | `models.py` (modelo `Candle`, tabla `candles`) y `session.py` (engine + `SessionLocal`). |
+| Ingesta | `backend/app/ingest/candles.py` | Descarga de Binance con reintentos, upsert idempotente, `ingest_latest` y `backfill`. Importable por Airflow. |
 | Migraciones | `backend/alembic/` | Esquema de PostgreSQL versionado. |
 
-**Flujo paso a paso (fase 1)**
+**Flujo paso a paso**
 
-1. **Carga inicial.** `CandleChart` pide `GET /api/klines?symbol=BTCUSDT&interval=1m&limit=500`
+1. **Ingesta.** `ingest_latest()` o `backfill()` piden velas a `/api/v3/klines`, descartan
+   la vela en curso, convierten cada fila a `Decimal` y `datetime` UTC y hacen upsert en
+   `candles`.
+2. **Carga inicial.** `CandleChart` pide `GET /api/klines?symbol=BTCUSDT&interval=1m&limit=500`
    y pasa el resultado a `series.setData()`.
-2. **Proxy.** `_binance_get` llama a `/api/v3/klines`. Si Binance responde con error, el
-   status se **propaga tal cual** (un `429` o `418` llega al navegador como `429` o `418`,
-   no disfrazado de `500`).
-3. **Conversión.** Binance devuelve un array de arrays con precios como *strings*; el
-   endpoint lo mapea a `Candle` y pasa `open_time` de milisegundos a **segundos UNIX**, que es
-   lo que espera lightweight-charts.
+3. **Lectura.** `get_klines` hace un `SELECT` ordenado por `open_time DESC` con `LIMIT`
+   (para quedarse con las más recientes), invierte el resultado a orden ascendente (lo exige
+   lightweight-charts) y convierte cada fila a `CandleOut`: `open_time` pasa a **segundos
+   UNIX** y los `Decimal` a `float`.
 4. **Refresco.** Cada 10 s se piden solo las 2 últimas velas y se aplican con
    `series.update()`. Se descarta cualquier vela más antigua que la última pintada, porque
-   `update()` no acepta retroceder en el tiempo.
-5. **Ticker.** `App.jsx` consulta `/api/ticker` cada 10 s para mostrar precio y variación 24 h.
+   `update()` no acepta retroceder en el tiempo. **Solo aparecen velas nuevas si alguien
+   corrió la ingesta entretanto.**
+5. **Ticker.** `App.jsx` consulta `/api/ticker` cada 10 s; `_binance_get` llama a
+   `/api/v3/ticker/24hr` y **propaga el status de Binance tal cual** (un `429` o `418` llega
+   al navegador como `429` o `418`, no disfrazado de `500`).
 
 ---
 
@@ -79,14 +98,15 @@ Binance banea el polling agresivo.
 │   ├── app/
 │   │   ├── main.py                 # FastAPI, CORS, router de mercado, /health
 │   │   ├── api/
-│   │   │   ├── market.py           # /api/klines y /api/ticker (proxy a Binance)
-│   │   │   └── schemas.py          # Candle, Ticker
+│   │   │   ├── market.py           # /api/klines (Postgres) y /api/ticker (proxy a Binance)
+│   │   │   └── schemas.py          # CandleOut, Ticker
 │   │   ├── core/
 │   │   │   └── config.py           # Settings desde variables de entorno
 │   │   ├── db/
-│   │   │   ├── models.py           # Base declarativa + tabla candles
+│   │   │   ├── models.py           # Base declarativa + modelo Candle (tabla candles)
 │   │   │   └── session.py          # engine (pool_pre_ping) + SessionLocal
-│   │   └── ingest/                 # Lógica de ingesta (fase 2) — importable por Airflow
+│   │   └── ingest/
+│   │       └── candles.py          # fetch con reintentos, upsert, ingest_latest, backfill
 │   ├── alembic/
 │   │   ├── env.py                  # Toma la URL de settings, no de alembic.ini
 │   │   └── versions/               # Historial de migraciones
@@ -105,6 +125,8 @@ Binance banea el polling agresivo.
 ├── infra/
 │   └── docker-compose.yml          # postgres + backend
 ├── Makefile                        # Atajos de Compose, psql y Alembic
+├── CONTEXTO.md                     # Estado actual del proyecto
+├── BITACORA.md                     # Bitácora append-only
 ├── .env.example
 └── .gitignore
 ```
@@ -134,22 +156,35 @@ se añade un `id` sustituto porque no aportaría nada y obligaría a un índice 
 
 **`NUMERIC` y no `FLOAT`.** Binance manda los precios como strings precisamente para no
 perder decimales. En cripto de bajo valor (p. ej. `0.00000123`) un `float` redondea; `Numeric`
-se mapea a `Decimal` en Python y conserva el valor exacto.
+se mapea a `Decimal` en Python y conserva el valor exacto. Por eso `to_rows` construye
+`Decimal(row[1])` directamente desde el string, sin pasar por `float`.
 
-### Estrategia de idempotencia (planeada)
+### Idempotencia
 
-Correr la misma ingesta dos veces debe dejar la base igual que correrla una vez. La
-herramienta es un **`INSERT ... ON CONFLICT (symbol, interval, open_time) DO UPDATE`**
-contra la PK compuesta: si la vela no existe se inserta, si existe se sobrescribe con los
-mismos valores.
+Correr la misma ingesta dos veces deja la base igual que correrla una vez. La herramienta es
+un **`INSERT ... ON CONFLICT (symbol, interval, open_time) DO UPDATE`** contra la PK
+compuesta (`upsert_candles`): si la vela no existe se inserta; si existe, se sobrescriben
+`open`, `high`, `low`, `close` y `volume` con los valores recibidos.
 
 Dos reglas acompañan al upsert:
 
-1. **Nunca persistir la vela en curso.** La última vela que devuelve `/api/v3/klines`
-   todavía está abierta y sus valores cambian. Se filtra por `close_time < ahora` antes de
-   guardar.
+1. **Nunca persistir la vela en curso.** Cuando se piden velas hasta el presente, la última
+   del array todavía está abierta y sus valores cambian. `ingest_latest` y la primera página
+   de `backfill` la descartan con `raw[:-1]`.
 2. **Paginar hacia atrás moviendo `endTime`, no `startTime`.** Máximo 1000 velas por
-   llamada; el backfill avanza hacia el pasado hasta alcanzar la fecha objetivo.
+   llamada. `backfill` arranca en el presente y en cada página fija
+   `endTime = open_time más antiguo - 1`, hasta cruzar la fecha `start` o hasta que Binance
+   no devuelva más historia. Las velas anteriores a `start` se filtran antes de guardar.
+
+### Funciones de `app/ingest/candles.py`
+
+| Función | Qué hace |
+|---|---|
+| `fetch_klines(symbol, interval, limit, **params)` | GET a `/api/v3/klines` con reintentos ante `429`/`418` (ver §4). |
+| `to_rows(symbol, interval, raw)` | Array de arrays de Binance → dicts listos para el upsert (`datetime` UTC, `Decimal`). |
+| `upsert_candles(rows)` | Upsert en una transacción; devuelve cuántas filas envió. |
+| `ingest_latest(symbol="BTCUSDT", interval="1m", limit=500)` | Últimas velas cerradas. |
+| `backfill(symbol, interval, start, page_size=1000)` | Historia desde `start` (que **debe** tener timezone) hasta hoy. |
 
 ### Migraciones
 
@@ -164,26 +199,41 @@ compara los modelos con el esquema real.
 Se usa `https://data-api.binance.vision` (solo market data) en lugar de `api.binance.com`:
 no requiere API key y evita bloqueos geográficos.
 
-| Situación | Qué hace hoy la API | Qué hará (fase 2) |
-|---|---|---|
-| `2xx` | Convierte a `Candle` / `Ticker` y responde | Igual, leyendo de Postgres |
-| `400` (símbolo o intervalo inválido) | Propaga `400` con el cuerpo de Binance | Igual |
-| `429` (rate limit) | Propaga `429` | Backoff respetando `Retry-After` |
-| `418` (IP baneada) | Propaga `418` | Detener la ingesta; el baneo escala de 2 min a 3 días |
-| Timeout (> 10 s) | Excepción de HTTPX → `500` | Reintento con backoff |
-
 - Límite: **6.000 de peso por minuto, por IP** (no por API key).
 - `X-MBX-USED-WEIGHT-1M` informa el peso consumido en la ventana actual.
 
-### Limitaciones de la fase 1 (declaradas a propósito)
+| Situación | `/api/ticker` (proxy) | Ingesta (`fetch_klines`) |
+|---|---|---|
+| `2xx` | Convierte a `Ticker` y responde | Devuelve el JSON |
+| `400` (símbolo o intervalo inválido) | Propaga `400` con el cuerpo de Binance | `raise_for_status()`: excepción, sin reintento |
+| `429` (rate limit) | Propaga `429` | Reintenta hasta 5 veces |
+| `418` (IP baneada) | Propaga `418` | Reintenta hasta 5 veces (ver pendiente abajo) |
+| Otro `4xx`/`5xx` | Propaga el status | Excepción, sin reintento |
+| Timeout (> 10 s) | Excepción de HTTPX → `500` | Excepción, sin reintento |
 
-1. **El refresco es polling REST cada 10 s.** Aceptable para una sola pestaña; es justo lo
+**Reintentos.** La espera es la de la cabecera `Retry-After` si Binance la manda (su número
+gana sobre nuestro cálculo); si no, backoff exponencial `1 s, 2 s, 4 s, 8 s`. Tras el quinto
+intento fallido no se espera más y se lanza `RuntimeError`.
+
+**Pendiente:** ante un `418` la ingesta debería detenerse en vez de reintentar, porque cada
+petición durante un baneo lo prolonga (escala de 2 min a 3 días).
+
+### Limitaciones actuales (declaradas a propósito)
+
+1. **La ingesta no corre sola.** Hay que ejecutarla a mano (ver §5). Airflow la orquestará
+   en la fase 4.
+2. **El refresco es polling REST cada 10 s.** Aceptable para una sola pestaña; es justo lo
    que la fase 3 sustituye por WebSocket → Redis Pub/Sub.
-2. **Cada request abre un `AsyncClient` nuevo.** Sin reutilización de conexiones. Suficiente
-   con este volumen; el salto natural es un cliente compartido creado en el `lifespan`.
-3. **No hay caché.** Cada pestaña abierta multiplica las llamadas a Binance.
-4. **El frontend pide `limit=2` en cada refresco** para cubrir el cruce de minuto: si entre
+3. **Cliente HTTP nuevo en cada llamada.** `_binance_get` abre un `AsyncClient` por request
+   y `fetch_klines` un `Client` por página del backfill. Sin reutilización de conexiones;
+   suficiente con este volumen.
+4. **El ticker no tiene caché.** Cada pestaña abierta multiplica las llamadas a Binance.
+5. **El frontend pide `limit=2` en cada refresco** para cubrir el cruce de minuto: si entre
    dos refrescos se cierra una vela, la anterior llega completa y la nueva empieza.
+6. **Con la tabla vacía el gráfico no se recupera.** `/api/klines` devuelve `[]`, el
+   componente falla al leer la última vela y no arranca el refresco. Hay que correr la
+   ingesta y recargar la página.
+7. **La ingesta usa `print`**, no `logging`.
 
 ---
 
@@ -216,7 +266,24 @@ Alembic corre **dentro** del contenedor porque `DATABASE_URL` apunta a `postgres
 nombre del servicio en la red de Compose. Desde el host, Postgres se expone en
 `localhost:${POSTGRES_PORT}` (5433 por defecto, para no chocar con un Postgres local).
 
-Frontend:
+### Cargar velas
+
+La tabla empieza vacía. La ingesta también corre dentro del contenedor `backend`:
+
+```bash
+# Últimas 500 velas cerradas de BTCUSDT 1m
+docker compose exec backend python -c \
+  "from app.ingest.candles import ingest_latest; print(ingest_latest())"
+
+# Historia desde una fecha (start debe llevar timezone)
+docker compose exec backend python -c \
+  "from datetime import datetime, timezone; from app.ingest.candles import backfill; \
+   print(backfill('BTCUSDT', '1m', datetime(2026, 9, 1, tzinfo=timezone.utc)))"
+```
+
+Ambas devuelven cuántas filas se enviaron al upsert. Correrlas dos veces no duplica nada.
+
+### Frontend
 
 ```bash
 cd frontend
@@ -232,6 +299,7 @@ La app queda en `http://localhost:5173`; la documentación interactiva de la API
 
 | Variable | Uso |
 |---|---|
+| `COMPOSE_FILE`, `COMPOSE_PROJECT_NAME` | Ubicación del compose y nombre del proyecto (ver arriba) |
 | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` | Inicialización del contenedor de Postgres |
 | `POSTGRES_PORT` | Puerto publicado en el host |
 | `DATABASE_URL` | Conexión de SQLAlchemy y Alembic (`postgresql+psycopg://...@postgres:5432/...`) |
@@ -243,13 +311,7 @@ La app queda en `http://localhost:5173`; la documentación interactiva de la API
 
 ## 6. Recorrido de una vela hasta el gráfico
 
-**a) El frontend pide velas:**
-
-```
-GET /api/klines?symbol=BTCUSDT&interval=1m&limit=500
-```
-
-**b) FastAPI llama a Binance**, que responde con un array de arrays:
+**a) La ingesta pide velas a Binance**, que responde con un array de arrays:
 
 ```json
 [
@@ -268,24 +330,43 @@ GET /api/klines?symbol=BTCUSDT&interval=1m&limit=500
 | `[4]` | close | `[10]` | taker buy quote volume |
 | `[5]` | volume | `[11]` | ignorar |
 
-**c) Qué ocurre dentro:**
+**b) `to_rows` la convierte y `upsert_candles` la guarda:**
 
-1. `_binance_get` hace la petición con timeout de 10 s y propaga cualquier error.
-2. Cada fila se convierte en `Candle`: `time = row[0] // 1000` y Pydantic transforma los
-   strings de precio a `float`.
-3. FastAPI valida la lista contra `response_model=list[Candle]` y responde:
+```python
+{"symbol": "BTCUSDT", "interval": "1m",
+ "open_time": datetime(2026, 9, 10, 0, 27, tzinfo=timezone.utc),  # 1789000020000 // 1000
+ "open": Decimal("65012.10000000"), "high": Decimal("65030.00000000"),
+ "low": Decimal("64998.50000000"), "close": Decimal("65020.40000000"),
+ "volume": Decimal("12.53100000")}
+```
+
+Solo se usan los índices `[0]` a `[5]`; el resto se ignora.
+
+**c) El frontend pide velas:**
+
+```
+GET /api/klines?symbol=BTCUSDT&interval=1m&limit=500
+```
+
+**d) FastAPI lee de Postgres y responde:**
+
+1. `SELECT ... WHERE symbol = 'BTCUSDT' AND interval = '1m' ORDER BY open_time DESC LIMIT 500`.
+2. Invierte el resultado a orden ascendente.
+3. Convierte cada fila a `CandleOut`: `time = int(open_time.timestamp())` y los `Decimal`
+   a `float`.
+4. FastAPI valida la lista contra `response_model=list[CandleOut]`:
 
 ```json
 [{"time":1789000020,"open":65012.1,"high":65030.0,"low":64998.5,"close":65020.4,"volume":12.531}]
 ```
 
-4. `CandleChart` llama a `series.setData(candles)` y guarda el `time` de la última vela.
+**e)** `CandleChart` llama a `series.setData(candles)` y guarda el `time` de la última vela.
 
 > En el contrato hacia el navegador se usa `float` a propósito: lightweight-charts solo
 > dibuja números y la precisión que se pierde no es visible en pantalla. El `Decimal` importa
 > donde se **guarda**, no donde se pinta.
 
-**d) Ticker:**
+**f) Ticker** (sin base de datos):
 
 ```
 GET /api/ticker?symbol=BTCUSDT
@@ -302,7 +383,7 @@ Cada fase queda funcionando de punta a punta antes de pasar a la siguiente.
 |---|---|---|
 | 0 — Andamiaje | Monorepo, Compose con Postgres, `/health`, CORS, variables de entorno | ✅ |
 | 1 — Rebanada vertical | Proxy a klines y ticker, velas en React con refresco de 10 s | ✅ |
-| 2 — PostgreSQL | Tabla `candles`, upsert idempotente, backfill paginado, API lee de Postgres | 🚧 |
+| 2 — PostgreSQL | Tabla `candles` ✅, upsert idempotente ✅, backfill paginado ✅, API lee de Postgres ✅, ingesta periódica ⏳ | 🚧 |
 | 3 — Redis y tiempo real | 3a: polling a Redis con TTL (cache-aside). 3b: WebSocket de Binance → Pub/Sub → WebSocket de FastAPI | ⏳ |
 | 4 — Airflow | DAG incremental diario y DAG de backfill con `catchup=True` (ZIP de `data.binance.vision`) | ⏳ |
 | 5 — MongoDB | Snapshots de order book y alertas/watchlists, con justificación frente a Postgres | ⏳ |
@@ -314,6 +395,7 @@ Cada fase queda funcionando de punta a punta antes de pasar a la siguiente.
 
 - **Timestamps siempre UTC.** `TIMESTAMPTZ` en Postgres; segundos UNIX (UTC) hacia el
   navegador. La conversión a hora local es responsabilidad de la capa de presentación.
+  `backfill` rechaza fechas naive con `ValueError`.
 - **Toda ingesta es idempotente.** La garantiza la PK de PostgreSQL, no la aplicación.
 - **Nunca se persiste la vela en curso.**
 - **La lógica vive en `app/ingest/`; los DAGs solo orquestan.** Lo que está dentro de una
@@ -334,6 +416,10 @@ Cada fase queda funcionando de punta a punta antes de pasar a la siguiente.
 | Propagar el status de Binance | Un `429`/`418` disfrazado de `500` oculta el problema real |
 | PK compuesta natural en `candles` | Es la identidad de la vela y el objetivo del `ON CONFLICT` |
 | `NUMERIC` para precios | Evita perder precisión en cripto de bajo valor |
+| Esquema de la API `CandleOut`, modelo de la base `Candle` | Evita el choque de nombres entre Pydantic y SQLAlchemy al importar ambos |
+| `/api/klines` síncrono | SQLAlchemy se usa en modo sync; FastAPI corre los `def` en un threadpool y no bloquea el event loop |
+| `Retry-After` gana sobre el backoff propio | Binance sabe cuánto falta para liberar la ventana |
+| Ingesta con `httpx.Client` síncrono | Se ejecuta como script o tarea de Airflow, donde no hay event loop |
 | `COMPOSE_FILE` + `COMPOSE_PROJECT_NAME` en `.env` | Conserva `infra/` sin escribir `-f`; a cambio, Compose se ejecuta desde la raíz |
 | Airflow aunque un cron bastaría | Objetivo pedagógico explícito, no técnico |
 | Mongo solo en fase 5, con caso justificado | No meter tecnología sin razón |
