@@ -38,7 +38,7 @@ export default function App() {
           </span>
         )}
       </h1>
-      <CandleChart symbol={SYMBOL} interval="1m" />
+      <CandleChart symbol={SYMBOL} interval="15m" />
     </div>
   );
 }

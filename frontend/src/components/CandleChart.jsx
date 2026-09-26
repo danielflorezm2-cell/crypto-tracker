@@ -1,12 +1,13 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { createChart, CandlestickSeries } from "lightweight-charts";
 import { getKlines } from "../lib/api";
 
 const REFRESH_MS = 10_000;
-const COLOMBIA_OFFSET = 5 * 60 * 60;
+const INITIAL_LIMIT = 500;
 
 export default function CandleChart({ symbol = "BTCUSDT", interval = "1m" }) {
   const containerRef = useRef(null);
+  const [empty, setEmpty] = useState(false);
 
   useEffect(() => {
     const chart = createChart(containerRef.current, {
@@ -15,37 +16,37 @@ export default function CandleChart({ symbol = "BTCUSDT", interval = "1m" }) {
       grid: { vertLines: { color: "#1e222d" }, horzLines: { color: "#1e222d" } },
       timeScale: { timeVisible: true },
     });
-
     const series = chart.addSeries(CandlestickSeries);
 
     // Evita que un fetch en vuelo escriba sobre un chart ya destruido
     let cancelled = false;
-    let timer = null;
+    // null = todavía no hay historia; el próximo tick intenta la carga completa
     let lastTime = null;
-    getKlines(symbol, interval, 500)
-      .then((candles) => {
-        if (cancelled) return;
-        series.setData(candles);
-        lastTime = candles[candles.length - 1].time;
-        console.log(lastTime);
-        console.log(candles[candles.length - 1].time);
 
-        timer = setInterval(() => {
-          getKlines(symbol, interval, 2)
-            .then((latest) => {
-              if (cancelled) return;
-                latest.forEach((candle) => {
-                    // update() no acepta retroceder en el tiempo: la vela anterior
-                    // ya está en la serie salvo justo al cruzar el cambio de minuto
-                    if (candle.time < lastTime) return;
-                    series.update(candle);
-                    lastTime = candle.time;
-                    })
-                })
-            .catch(console.error);
-        }, REFRESH_MS);
-      })
-      .catch(console.error);
+    const load = () => {
+      const initial = lastTime === null;
+
+      getKlines(symbol, interval, initial ? INITIAL_LIMIT : 2)
+        .then((candles) => {
+          if (cancelled) return;
+          if (initial) setEmpty(candles.length === 0);
+          if (candles.length === 0) return;
+
+          if (initial) {
+            series.setData(candles);
+          } else {
+            // update() no acepta retroceder en el tiempo: se saltea lo ya pintado
+            candles.forEach((candle) => {
+              if (candle.time >= lastTime) series.update(candle);
+            });
+          }
+          lastTime = candles[candles.length - 1].time;
+        })
+        .catch(console.error);
+    };
+
+    load();
+    const timer = setInterval(load, REFRESH_MS);
 
     return () => {
       cancelled = true;
@@ -54,5 +55,23 @@ export default function CandleChart({ symbol = "BTCUSDT", interval = "1m" }) {
     };
   }, [symbol, interval]);
 
-  return <div ref={containerRef} style={{ height: 400, width: "100%" }} />;
+  return (
+    <div style={{ position: "relative" }}>
+      <div ref={containerRef} style={{ height: 400, width: "100%", isolation: "isolate" }} />
+      {empty && (
+        <p
+          style={{
+            position: "absolute",
+            inset: 0,
+            margin: 0,
+            display: "grid",
+            placeItems: "center",
+            pointerEvents: "none",
+          }}
+        >
+          No candles for {symbol} {interval} yet
+        </p>
+      )}
+    </div>
+  );
 }
