@@ -7,13 +7,19 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:?falta en .env}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?falta en .env}
       POSTGRES_DB: ${POSTGRES_DB:?falta en .env}
-
     ports:
       - "${POSTGRES_PORT}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      retries: 5
+
+  redis:
+    image: redis:7
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       retries: 5
 
@@ -24,12 +30,31 @@ services:
       CORS_ORIGINS: ${CORS_ORIGINS:?falta en .env}
       BINANCE_REST_URL: ${BINANCE_REST_URL:?falta en .env}
       DATABASE_URL: ${DATABASE_URL:?falta en .env}
+      REDIS_URL: ${REDIS_URL:?falta en .env}
     ports:
       - "${BACKEND_PORT}:8000"
     volumes:
       - ../backend:/code
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: ../backend
+    # -u: stdout sin buffer; si no, los print no aparecen en docker compose logs
+    command: python -u -m app.ingest.ticker
+    environment:
+      BINANCE_REST_URL: ${BINANCE_REST_URL:?falta en .env}
+      REDIS_URL: ${REDIS_URL:?falta en .env}
+      # El worker no usa Postgres, pero Settings exige database_url al importarse
+      DATABASE_URL: ${DATABASE_URL:?falta en .env}
+    volumes:
+      - ../backend:/code
+    restart: unless-stopped
+    depends_on:
+      redis:
         condition: service_healthy
 
 volumes:
