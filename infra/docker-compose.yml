@@ -43,6 +43,7 @@ services:
 
   worker:
     build: ../backend
+    init: true
     # -u: stdout sin buffer; si no, los print no aparecen en docker compose logs
     command: python -u -m app.ingest.ticker
     environment:
