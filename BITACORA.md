@@ -135,3 +135,61 @@ la tabla no tiene filas para ese `interval` y se ve el aviso de vacío.
 y no se monta ningún mecanismo provisional mientras tanto. Corrige el "Siguiente" de las
 entradas anteriores de 2026-09-26, que la ponían como pendiente de esta fase.
 **Siguiente:** Decidir si `418` corta la ingesta; probar el backfill para cerrar la fase 2.
+
+### 2026-09-26 — `418` corta la ingesta y fase 3a: ticker vía Redis
+
+**Hecho:** `fetch_klines` ya no reintenta ante `418`: lanza `RuntimeError` con el
+`Retry-After` en el mensaje; solo el `429` se reintenta (`3296a77`). Servicio `redis`
+(redis:7 con healthcheck) en Compose y `REDIS_URL` en `.env.example` (`09872c4`).
+`app/db/cache.py` con un cliente de Redis por proceso y `ticker_key` (`3476132`).
+`app/ingest/ticker.py`: worker que consulta `/api/v3/ticker/24hr` cada 2 s y guarda
+`ticker:BTCUSDT` con TTL de 10 s; `/api/ticker` deja de llamar a Binance y lee de Redis,
+con `503` si no hay clave; `redis_url` en `Settings`, `redis==8.1.0` y `make redis`
+(`43e0b26`). Servicio `worker` en Compose (`python -u -m app.ingest.ticker`,
+`restart: unless-stopped`, `init: true`); `App.jsx` refresca el ticker cada 2 s y, si la
+petición falla, conserva el último precio en gris con la marca `· stale` (`5377e5d`).
+README, CONTEXTO y esta bitácora al día.
+**Problemas:** Sin `-u` los `print` del worker no aparecen en `docker compose logs`
+(stdout con buffer). El servicio `worker` necesitó un ajuste de `init` en Compose
+(`5377e5d`).
+**Aprendido:** El TTL sirve como señal de salud: si el worker muere, la clave expira y la
+API puede distinguir "no hay dato reciente" en vez de servir un precio viejo. Pedir desde
+el navegador más rápido de lo que escribe el worker no trae datos nuevos.
+**Decisiones:** Un solo escritor (el worker) y la API solo lee, para que las llamadas a
+Binance no crezcan con las pestañas abiertas. El valor en Redis usa nuestro formato y no
+el de Binance, para que la fase 3b cambie la fuente sin tocar la API. `418` corta la
+ingesta de velas porque reintentar durante un baneo lo alarga; resuelve la duda anotada
+en las entradas anteriores de 2026-09-26.
+**Siguiente:** Quitar la versión vieja de `get_ticker` que quedó al final de `market.py`;
+probar el backfill para cerrar la fase 2; fase 3b (WebSocket → Pub/Sub).
+
+### 2026-09-26 — Limpieza de `market.py`
+
+**Hecho:** Se elimina la versión vieja de `get_ticker` (async, llamaba a `_binance_get`,
+que ya no existía) que había quedado al final de `market.py`, y la constante `TIMEOUT` sin
+uso. `/openapi.json` expone una sola ruta `/api/ticker`, la que lee de Redis.
+**Aprendido:** FastAPI permite registrar dos veces la misma ruta sin error; atiende la
+primera y la segunda queda como código muerto.
+**Siguiente:** Probar el backfill para cerrar la fase 2; fase 3b (WebSocket → Pub/Sub).
+
+### 2026-09-26 — Diagramación de la API
+
+**Hecho:** Se crea `docs/api.html`, un HTML autocontenido (SVG inline, sin dependencias
+externas, tema claro y oscuro): diagramas C4 de contexto, contenedores y componentes de la
+API; referencia de `/api/klines`, `/api/ticker` y `/health` con parámetros, status y
+ejemplos; secuencias de lectura de velas, del ticker (worker + API) y de la ingesta;
+modelo de datos (tabla `candles` y clave `ticker:<SYMBOL>`), errores de Binance y
+variables de entorno. Enlazado desde el README.
+**Decisiones:** Los diagramas son SVG inline y no Mermaid ni PlantUML cargados desde
+un CDN, para que el archivo abra sin conexión.
+**Siguiente:** Mantener `docs/api.html` al día cuando cambien endpoints o contenedores
+(fase 3b agrega Pub/Sub y un WebSocket en FastAPI).
+
+### 2026-09-26 — Generador de `docs/api.html`
+
+**Hecho:** Se versiona `docs/gen_api_html.py`, el script que produce `docs/api.html` (solo
+biblioteca estándar; escribe junto a sí mismo, así que se puede correr desde cualquier
+carpeta). Regenerado, el HTML queda idéntico al versionado.
+**Decisiones:** `docs/api.html` pasa a ser un archivo generado: los cambios se hacen en el
+script y se regenera con `python3 docs/gen_api_html.py`. Las coordenadas de los diagramas
+viven en las funciones `c4_*` y el contenido de las secuencias en `seq_*`.

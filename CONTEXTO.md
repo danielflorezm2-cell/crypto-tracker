@@ -17,7 +17,8 @@ releer todo el código.
 ## 1. Qué es y para qué
 
 App web que grafica velas de criptomonedas con datos públicos de Binance. React + Vite +
-lightweight-charts; FastAPI + SQLAlchemy + Alembic sobre PostgreSQL; Docker Compose.
+lightweight-charts; FastAPI + SQLAlchemy + Alembic sobre PostgreSQL, Redis para el precio
+en vivo; Docker Compose.
 
 **El objetivo es aprender el stack y el flujo de un proyecto de datos, no la app en sí.**
 Por eso se prefiere el código mínimo que resuelve la fase actual, sin abstracciones
@@ -25,40 +26,55 @@ Por eso se prefiere el código mínimo que resuelve la fase actual, sin abstracc
 
 ## 2. Fase actual
 
-**Fase 2 — PostgreSQL e ingesta idempotente** (🚧). Plan completo en `README.md` §7.
+**Fase 3a — ticker vía Redis** (✅ implementada). La fase 2 queda abierta solo por la
+prueba del backfill. Plan completo en `README.md` §8; detalle de Redis en §4.
 
 | Pieza | Estado | Dónde |
 |---|---|---|
 | Tabla `candles` (PK `symbol, interval, open_time`, `NUMERIC`) | ✅ | `backend/app/db/models.py` |
 | Migración inicial con Alembic | ✅ | `backend/alembic/versions/92e1536d2411_*` |
-| `fetch_klines` con reintentos ante `429`/`418` (respeta `Retry-After`) | ✅ | `backend/app/ingest/candles.py` |
+| `fetch_klines`: reintenta `429` (respeta `Retry-After`), corta con `RuntimeError` ante `418` | ✅ | `backend/app/ingest/candles.py` |
 | `upsert_candles` con `ON CONFLICT DO UPDATE` | ✅ | `backend/app/ingest/candles.py` |
 | `ingest_latest` (descarta la vela en curso) | ✅ | `backend/app/ingest/candles.py` |
-| `backfill` paginando hacia atrás con `endTime` | ✅ | `backend/app/ingest/candles.py` |
+| `backfill` paginando hacia atrás con `endTime` | ✅ código, ❓ prueba sin registrar | `backend/app/ingest/candles.py` |
 | `/api/klines` lee de Postgres (sync) | ✅ | `backend/app/api/market.py` |
-| `/api/ticker` sigue siendo proxy directo a Binance (async) | ✅ a propósito | `backend/app/api/market.py` |
+| Servicio `redis` (redis:7, con healthcheck, sin volumen ni puerto publicado) | ✅ | `infra/docker-compose.yml` |
+| Cliente de Redis por proceso + `ticker_key` | ✅ | `backend/app/db/cache.py` |
+| Worker: ticker de Binance cada 2 s → `ticker:<SYMBOL>` con TTL 10 s | ✅ | `backend/app/ingest/ticker.py`, servicio `worker` |
+| `/api/ticker` lee de Redis (sync); `503` si no hay clave | ✅ | `backend/app/api/market.py` |
+| Frontend: ticker cada 2 s, marca `· stale` en gris si falla | ✅ | `frontend/src/App.jsx` |
 | Gráfico tolera la tabla vacía (aviso + reintenta la carga completa) | ✅ | `frontend/src/components/CandleChart.jsx` |
-| Dependencias de base de datos fijadas (`alembic`, `SQLAlchemy`, `psycopg`) | ✅ | `backend/requirements.txt` |
+| `redis==8.1.0` en dependencias; `make redis` | ✅ | `backend/requirements.txt`, `Makefile` |
 | Tests | ❌ (carpeta `backend/tests/` vacía) | — |
 
 ## 3. Pendientes inmediatos
 
-1. **Criterio de cierre de la fase 2:** backfill probado + API leyendo de Postgres +
-   README al día.
-2. **La ingesta periódica no es de esta fase.** Se corre a mano a propósito; la
-   automatiza Airflow en la fase 4, sin mecanismo provisional (ni cron ni scheduler en
-   FastAPI). Mientras tanto, el refresco de 10 s del frontend solo muestra velas nuevas si
-   se ingirió a mano entre refresco y refresco.
+1. **Cerrar la fase 2:** probar el backfill y dejarlo anotado en la bitácora.
+2. **Fase 3b:** WebSocket de Binance en el worker → Redis Pub/Sub → WebSocket de FastAPI →
+   navegador, para dejar el polling. El formato propio del valor en Redis está pensado para
+   que ese cambio no toque la API.
+3. **La ingesta periódica de velas no es de esta fase.** Se corre a mano a propósito; la
+   automatiza Airflow en la fase 4, sin mecanismo provisional. Mientras tanto, el refresco
+   de 10 s del gráfico solo muestra velas nuevas si se ingirió a mano entre refresco y
+   refresco.
 
 ## 4. Dudas abiertas y discrepancias conocidas
 
-- **`418` se reintenta.** El README dice que ante un `418` la ingesta debe detenerse (el
-  baneo escala de 2 min a 3 días), pero `fetch_klines` lo trata igual que un `429`.
+- **El worker hace polling REST cada 2 s**, contra la regla "WebSocket para tiempo real".
+  Aceptado como paso intermedio hasta la 3b; pesa ~60/min de los 6.000 permitidos.
+- **El worker sigue un solo símbolo** (`BTCUSDT`, constante en `ticker.py`). Cualquier
+  otro símbolo en `/api/ticker` da `503`.
+- **El worker no tiene `--reload`:** tras editar `ticker.py` hay que
+  `docker compose restart worker`.
+- **Redis caído → `500` en `/api/ticker`**, no `503`: `get_ticker` no captura
+  `redis.RedisError`. El frontend lo trata igual (marca `stale`).
+- **El worker exige `DATABASE_URL`** aunque no use Postgres, porque `Settings` la declara
+  obligatoria.
 - **Un `httpx.Client` nuevo por página** en `fetch_klines`: en un backfill largo no se
   reutilizan conexiones.
-- **`print` en lugar de `logging`** en la ingesta.
-- **El intervalo está fijo en `App.jsx`** (`interval="1m"`). Se probaron `1m`, `5m` y
-  `15m` cambiándolo a mano; el gráfico solo muestra los intervalos que se hayan ingerido.
+- **`print` en lugar de `logging`** en la ingesta y el worker.
+- **El intervalo está fijo en `App.jsx`** (`interval="1m"`). El gráfico solo muestra los
+  intervalos que se hayan ingerido.
 - **`ingest_latest` descarta la vela en curso**, así que el refresco nunca pinta la vela
   abierta: el gráfico avanza de a una vela cerrada por ingesta.
 - `airflow/dags/` y `backend/tests/` existen localmente pero están vacías (git no las
@@ -67,22 +83,26 @@ Por eso se prefiere el código mínimo que resuelve la fase actual, sin abstracc
 ## 5. Cómo retomar
 
 ```bash
-cp .env.example .env   # solo la primera vez
-make up
+cp .env.example .env   # solo la primera vez; ahora incluye REDIS_URL
+make up                # postgres, redis, backend y worker
 make migrate
 cd frontend && npm install && npm run dev
 ```
 
-Ejecutar la ingesta a mano (desde la raíz del repo; `interval` por defecto es `"1m"`):
+Ejecutar la ingesta de velas a mano (desde la raíz del repo; `interval` por defecto es `"1m"`):
 
 ```bash
 docker compose exec backend python -c \
   "from app.ingest.candles import ingest_latest; print(ingest_latest(interval='1m'))"
 ```
 
-Si se cambió `requirements.txt`, reconstruir la imagen del backend antes de probar
-(`make up` **no** reconstruye): `docker compose up -d --build backend`.
+Comprobar el ticker: `docker compose logs -f worker` y `make redis` → `GET ticker:BTCUSDT`
+/ `TTL ticker:BTCUSDT`.
+
+Si se cambió `requirements.txt`, reconstruir la imagen antes de probar (`make up` **no**
+reconstruye): `docker compose up -d --build backend worker`. Un `.env` creado antes de
+2026-09-26 no tiene `REDIS_URL`: Compose falla con `falta en .env` hasta agregarla.
 
 Recordatorios que muerden: Compose se ejecuta **siempre desde la raíz** (ver `README.md`
-§5); Postgres se expone en el host en `localhost:5433`; Alembic corre **dentro** del
-contenedor.
+§6); Postgres se expone en el host en `localhost:5433`; Redis no se expone; Alembic corre
+**dentro** del contenedor.

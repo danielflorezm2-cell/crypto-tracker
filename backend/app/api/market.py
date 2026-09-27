@@ -11,8 +11,6 @@ from app.db.session import SessionLocal
 
 router = APIRouter(prefix="/api", tags=["market"])
 
-TIMEOUT = 10.0
-
 
 @router.get("/ticker", response_model=Ticker)
 def get_ticker(symbol: str = "BTCUSDT"):
@@ -49,13 +47,4 @@ def get_klines(
                 volume=float(c.volume),
             )
             for c in reversed(candles)
-        ]   
-
-@router.get("/ticker", response_model=Ticker)
-async def get_ticker(symbol: str = "BTCUSDT"):
-    data = await _binance_get("/api/v3/ticker/24hr", {"symbol": symbol})
-    return Ticker(
-        symbol=data["symbol"],
-        last_price=data["lastPrice"],
-        price_change_percent=data["priceChangePercent"],
-    )
+        ]

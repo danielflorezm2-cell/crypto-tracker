@@ -2,17 +2,20 @@
 
 Aplicación web que **grafica precios de criptomonedas en tiempo real e históricos** usando
 los datos públicos de Binance. React + Vite + lightweight-charts en el frontend; FastAPI +
-Pydantic + HTTPX + SQLAlchemy + Alembic sobre PostgreSQL en el backend; todo en Docker Compose.
+Pydantic + HTTPX + SQLAlchemy + Alembic sobre PostgreSQL, y Redis como caché del precio en
+vivo, en el backend; todo en Docker Compose.
 
 **El objetivo no es la aplicación: es aprender el stack y el flujo de trabajo de un proyecto
 de datos.** No es un proyecto de producción: no hay usuarios, ni SLA, ni dinero real en juego.
 Por eso el código busca ser el mínimo que resuelve la fase actual, sin capas ni abstracciones
 "por si acaso".
 
-> **Estado:** fase 2 (PostgreSQL e ingesta idempotente) en curso. Ya están la tabla
-> `candles`, el upsert idempotente, el backfill paginado con reintentos ante `429`/`418` y
-> `/api/klines` leyendo de Postgres. La ingesta se corre a mano a propósito: ejecutarla de
-> forma periódica es trabajo de Airflow en la fase 4.
+> **Estado:** fase 3a (ticker vía Redis) implementada. Un worker consulta el ticker de
+> Binance cada 2 s y lo guarda en Redis con TTL; `/api/ticker` solo lee de Redis. De la
+> fase 2 están la tabla `candles`, el upsert idempotente, el backfill paginado y
+> `/api/klines` leyendo de Postgres; falta dejar registrada la prueba del backfill para
+> cerrarla. La ingesta de velas se corre a mano a propósito: ejecutarla de forma periódica
+> es trabajo de Airflow en la fase 4.
 
 **Documentos de trabajo**
 
@@ -21,28 +24,31 @@ Por eso el código busca ser el mínimo que resuelve la fase actual, sin capas n
 | `README.md` | Documentación estable: arquitectura, puesta en marcha, convenciones y decisiones. |
 | [`CONTEXTO.md`](CONTEXTO.md) | Estado actual, pendientes y dudas abiertas. Se reescribe. |
 | [`BITACORA.md`](BITACORA.md) | Historia del trabajo, sesión por sesión. Append-only. |
+| [`docs/api.html`](docs/api.html) | Diagramación de la API: C4 (contexto, contenedores, componentes), endpoints, secuencias y modelo de datos. Abrir en el navegador. **Generado**: se edita [`docs/gen_api_html.py`](docs/gen_api_html.py) y se corre `python3 docs/gen_api_html.py`. |
 
 ---
 
 ## 1. Arquitectura y flujo de datos
 
-### Hoy (fase 2 en curso)
+### Hoy (fase 3a)
 
 ```
-                    ┌── GET /api/klines ──> FastAPI (:8000) ──SELECT──> PostgreSQL
-React (Vite :5173) ─┤   (proxy de Vite)                                     ▲
-                    └── GET /api/ticker ──> FastAPI ──HTTPX async──> Binance │
-                                                                             │ upsert
- app.ingest.candles (a mano) ──HTTPX sync──> data-api.binance.vision ────────┘
+                    ┌── GET /api/klines (10 s) ──> FastAPI (:8000) ──SELECT──> PostgreSQL
+React (Vite :5173) ─┤   (proxy de Vite)                                            ▲
+                    └── GET /api/ticker (2 s) ───> FastAPI ──GET──> Redis          │
+                                                                      ▲            │ upsert
+ worker (app.ingest.ticker, cada 2 s) ──HTTPX──> Binance ──SET EX 10──┘            │
+ app.ingest.candles (a mano) ──────────HTTPX──> Binance ───────────────────────────┘
 ```
 
-Hay dos caminos:
+Hay dos caminos, y **la API ya no llama a Binance en ninguno**:
 
-- **Velas:** se leen de PostgreSQL. La tabla se llena con la ingesta (`app/ingest/`), que
-  pide velas a Binance y las guarda con un upsert idempotente. **La API ya no llama a
-  Binance para velas.**
-- **Ticker:** sigue siendo un proxy directo a Binance. Se deja así a propósito: es un solo
-  dato vivo que no vale la pena persistir; la fase 3 lo pasará a Redis.
+- **Velas:** se leen de PostgreSQL. La tabla se llena con la ingesta (`app/ingest/candles.py`),
+  que pide velas a Binance y las guarda con un upsert idempotente.
+- **Ticker:** se lee de Redis. Lo escribe el servicio `worker` de Compose
+  (`app/ingest/ticker.py`), que consulta `/api/v3/ticker/24hr` cada 2 s y guarda la clave
+  `ticker:<SYMBOL>` con un TTL de 10 s. Si la clave no existe (worker caído, atrasado o
+  símbolo no seguido), `/api/ticker` responde `503`.
 
 ### Objetivo (fases 2–5)
 
@@ -60,13 +66,14 @@ Binance banea el polling agresivo.
 
 | Capa | Archivos | Responsabilidad |
 |---|---|---|
-| Frontend | `frontend/src/` | `App.jsx` muestra el ticker; `CandleChart.jsx` pinta velas y refresca cada 10 s. |
+| Frontend | `frontend/src/` | `App.jsx` muestra el ticker (refresco de 2 s, marca "stale" si falla); `CandleChart.jsx` pinta velas y refresca cada 10 s. |
 | Cliente HTTP (front) | `frontend/src/lib/api.js` | `fetch` con URL relativa: Vite hace de intermediario, así no hay CORS en desarrollo. |
-| API | `backend/app/api/market.py` | `/api/klines` lee de Postgres; `/api/ticker` hace proxy a Binance con HTTPX. |
+| API | `backend/app/api/market.py` | `/api/klines` lee de Postgres; `/api/ticker` lee de Redis. Ninguno llama a Binance. |
 | Esquemas | `backend/app/api/schemas.py` | Pydantic: `CandleOut` y `Ticker`, el contrato con el frontend. |
 | Configuración | `backend/app/core/config.py` | `Settings` desde variables de entorno (pydantic-settings). |
-| Base de datos | `backend/app/db/` | `models.py` (modelo `Candle`, tabla `candles`) y `session.py` (engine + `SessionLocal`). |
-| Ingesta | `backend/app/ingest/candles.py` | Descarga de Binance con reintentos, upsert idempotente, `ingest_latest` y `backfill`. Importable por Airflow. |
+| Base de datos | `backend/app/db/` | `models.py` (modelo `Candle`, tabla `candles`), `session.py` (engine + `SessionLocal`) y `cache.py` (cliente de Redis + `ticker_key`). |
+| Ingesta de velas | `backend/app/ingest/candles.py` | Descarga de Binance con reintentos, upsert idempotente, `ingest_latest` y `backfill`. Importable por Airflow. |
+| Worker del ticker | `backend/app/ingest/ticker.py` | Bucle infinito: consulta el ticker cada 2 s y lo escribe en Redis con TTL. Corre como servicio `worker`. |
 | Migraciones | `backend/alembic/` | Esquema de PostgreSQL versionado. |
 
 **Flujo paso a paso**
@@ -86,9 +93,13 @@ Binance banea el polling agresivo.
    `series.update()`. Se descarta cualquier vela más antigua que la última pintada, porque
    `update()` no acepta retroceder en el tiempo. **Solo aparecen velas nuevas si alguien
    corrió la ingesta entretanto.**
-5. **Ticker.** `App.jsx` consulta `/api/ticker` cada 10 s; `_binance_get` llama a
-   `/api/v3/ticker/24hr` y **propaga el status de Binance tal cual** (un `429` o `418` llega
-   al navegador como `429` o `418`, no disfrazado de `500`).
+5. **Ticker (escritura).** El worker pide `/api/v3/ticker/24hr?symbol=BTCUSDT` cada 2 s,
+   lo traduce a **nuestro formato** (`symbol`, `last_price`, `price_change_percent`) y hace
+   `SET ticker:BTCUSDT <json> EX 10`.
+6. **Ticker (lectura).** `App.jsx` consulta `/api/ticker` cada 2 s; `get_ticker` hace un
+   `GET` a Redis y valida el JSON contra `Ticker`. Si la clave expiró responde `503`, y el
+   frontend conserva el último precio pero lo pinta en gris con la marca `· stale`. En
+   cuanto vuelve un `200`, la marca desaparece.
 
 ---
 
@@ -100,15 +111,17 @@ Binance banea el polling agresivo.
 │   ├── app/
 │   │   ├── main.py                 # FastAPI, CORS, router de mercado, /health
 │   │   ├── api/
-│   │   │   ├── market.py           # /api/klines (Postgres) y /api/ticker (proxy a Binance)
+│   │   │   ├── market.py           # /api/klines (Postgres) y /api/ticker (Redis)
 │   │   │   └── schemas.py          # CandleOut, Ticker
 │   │   ├── core/
 │   │   │   └── config.py           # Settings desde variables de entorno
 │   │   ├── db/
 │   │   │   ├── models.py           # Base declarativa + modelo Candle (tabla candles)
-│   │   │   └── session.py          # engine (pool_pre_ping) + SessionLocal
+│   │   │   ├── session.py          # engine (pool_pre_ping) + SessionLocal
+│   │   │   └── cache.py            # Cliente de Redis + ticker_key
 │   │   └── ingest/
-│   │       └── candles.py          # fetch con reintentos, upsert, ingest_latest, backfill
+│   │       ├── candles.py          # fetch con reintentos, upsert, ingest_latest, backfill
+│   │       └── ticker.py           # Worker: ticker de Binance → Redis cada 2 s
 │   ├── alembic/
 │   │   ├── env.py                  # Toma la URL de settings, no de alembic.ini
 │   │   └── versions/               # Historial de migraciones
@@ -117,7 +130,7 @@ Binance banea el polling agresivo.
 │   └── requirements.txt
 ├── frontend/
 │   ├── src/
-│   │   ├── App.jsx                 # Cabecera con ticker + gráfico
+│   │   ├── App.jsx                 # Cabecera con ticker (2 s, marca stale) + gráfico
 │   │   ├── components/
 │   │   │   └── CandleChart.jsx     # lightweight-charts, carga inicial + refresco
 │   │   └── lib/
@@ -125,8 +138,11 @@ Binance banea el polling agresivo.
 │   ├── vite.config.js              # Proxy /api → localhost:8000
 │   └── package.json
 ├── infra/
-│   └── docker-compose.yml          # postgres + backend
-├── Makefile                        # Atajos de Compose, psql y Alembic
+│   └── docker-compose.yml          # postgres + redis + backend + worker
+├── docs/
+│   ├── api.html                    # Diagramas C4, endpoints y secuencias (generado)
+│   └── gen_api_html.py             # Generador de api.html (solo biblioteca estándar)
+├── Makefile                        # Atajos de Compose, psql, redis-cli y Alembic
 ├── CONTEXTO.md                     # Estado actual del proyecto
 ├── BITACORA.md                     # Bitácora append-only
 ├── .env.example
@@ -182,7 +198,7 @@ Dos reglas acompañan al upsert:
 
 | Función | Qué hace |
 |---|---|
-| `fetch_klines(symbol, interval, limit, **params)` | GET a `/api/v3/klines` con reintentos ante `429`/`418` (ver §4). |
+| `fetch_klines(symbol, interval, limit, **params)` | GET a `/api/v3/klines`: reintenta ante `429`, corta ante `418` (ver §5). |
 | `to_rows(symbol, interval, raw)` | Array de arrays de Binance → dicts listos para el upsert (`datetime` UTC, `Decimal`). |
 | `upsert_candles(rows)` | Upsert en una transacción; devuelve cuántas filas envió. |
 | `ingest_latest(symbol="BTCUSDT", interval="1m", limit=500)` | Últimas velas cerradas. |
@@ -196,7 +212,56 @@ compara los modelos con el esquema real.
 
 ---
 
-## 4. Binance: límites y manejo de errores
+## 4. Ticker en Redis (fase 3a)
+
+Patrón: **un solo proceso escribe, la API solo lee.** El worker es el único que habla con
+Binance para el ticker; la API y los navegadores leen de Redis. Así, abrir más pestañas no
+multiplica las llamadas a Binance.
+
+| Pieza | Valor | Dónde |
+|---|---|---|
+| Clave | `ticker:<SYMBOL>` (p. ej. `ticker:BTCUSDT`) | `ticker_key` en `app/db/cache.py` |
+| Valor | JSON `{"symbol", "last_price", "price_change_percent"}` (strings, tal como llegan de Binance) | `poll_once` en `app/ingest/ticker.py` |
+| Frecuencia de escritura | `POLL_SECONDS = 2` | `app/ingest/ticker.py` |
+| TTL | `TTL_SECONDS = 10` | `app/ingest/ticker.py` |
+| Refresco del frontend | `REFRESH_MS = 2_000` | `frontend/src/App.jsx` |
+| Símbolo seguido | `SYMBOL = "BTCUSDT"` (uno solo) | `app/ingest/ticker.py` |
+
+**El TTL es la señal de salud.** Con 10 s de TTL y escrituras cada 2 s, un par de fallos
+seguidos no hacen expirar la clave; si el worker se cae o se atasca, la clave desaparece y
+la API responde `503` en vez de servir un precio viejo como si fuera actual. El frontend
+tampoco pide más rápido que el worker escribe: no traería datos nuevos.
+
+**El formato es nuestro, no el de Binance.** El worker traduce `lastPrice` y
+`priceChangePercent` antes de guardar. Cuando en la fase 3b la fuente pase a ser el
+WebSocket de Binance, solo cambia el worker; la API y el frontend no se enteran.
+
+**Errores en el worker.** El bucle nunca termina por un error:
+
+| Situación | Qué hace |
+|---|---|
+| `429` / `418` | Duerme lo que diga `Retry-After` (60 s si no viene) y sigue |
+| Otro status de error | Lo imprime y sigue en la próxima vuelta |
+| Error de red (`httpx.TransportError`) o de Redis (`redis.RedisError`) | Lo imprime como transitorio y sigue |
+
+Durante esas esperas la clave expira y el frontend muestra el precio como `stale`.
+
+**Servicio en Compose.** `worker` usa la misma imagen que `backend` y monta `../backend`
+como volumen, pero ejecuta `python -u -m app.ingest.ticker`:
+
+- `-u` desactiva el buffer de stdout; sin él, los `print` no aparecen en `docker compose logs`.
+- `init: true` pone un init (tini) como PID 1 para que `docker compose stop` le llegue al
+  proceso de Python y el contenedor pare al instante en vez de esperar el timeout.
+- `restart: unless-stopped`: si el proceso muere, Compose lo levanta de nuevo.
+- Necesita `DATABASE_URL` aunque no use Postgres, porque `Settings` la exige al importarse.
+- **No tiene `--reload`:** los cambios en `ticker.py` requieren `docker compose restart worker`.
+
+El cliente de Redis (`cache`) es uno por proceso, igual que el engine de SQLAlchemy, con
+`decode_responses=True` para recibir `str` y no `bytes`.
+
+---
+
+## 5. Binance: límites y manejo de errores
 
 Se usa `https://data-api.binance.vision` (solo market data) en lugar de `api.binance.com`:
 no requiere API key y evita bloqueos geográficos.
@@ -204,39 +269,55 @@ no requiere API key y evita bloqueos geográficos.
 - Límite: **6.000 de peso por minuto, por IP** (no por API key).
 - `X-MBX-USED-WEIGHT-1M` informa el peso consumido en la ventana actual.
 
-| Situación | `/api/ticker` (proxy) | Ingesta (`fetch_klines`) |
+La API ya no llama a Binance; solo lo hacen la ingesta de velas y el worker del ticker.
+
+| Situación | Ingesta de velas (`fetch_klines`) | Worker del ticker |
 |---|---|---|
-| `2xx` | Convierte a `Ticker` y responde | Devuelve el JSON |
-| `400` (símbolo o intervalo inválido) | Propaga `400` con el cuerpo de Binance | `raise_for_status()`: excepción, sin reintento |
-| `429` (rate limit) | Propaga `429` | Reintenta hasta 5 veces |
-| `418` (IP baneada) | Propaga `418` | Reintenta hasta 5 veces (ver pendiente abajo) |
-| Otro `4xx`/`5xx` | Propaga el status | Excepción, sin reintento |
-| Timeout (> 10 s) | Excepción de HTTPX → `500` | Excepción, sin reintento |
+| `2xx` | Devuelve el JSON | Escribe en Redis |
+| `400` (símbolo o intervalo inválido) | `raise_for_status()`: excepción, sin reintento | Lo imprime y sigue |
+| `429` (rate limit) | Reintenta hasta 5 veces | Duerme `Retry-After` y sigue |
+| `418` (IP baneada) | **`RuntimeError` inmediato**, sin reintento | Duerme `Retry-After` y sigue |
+| Otro `4xx`/`5xx` | Excepción, sin reintento | Lo imprime y sigue |
+| Timeout | > 10 s: excepción, sin reintento | > 5 s: lo imprime y sigue |
 
-**Reintentos.** La espera es la de la cabecera `Retry-After` si Binance la manda (su número
-gana sobre nuestro cálculo); si no, backoff exponencial `1 s, 2 s, 4 s, 8 s`. Tras el quinto
-intento fallido no se espera más y se lanza `RuntimeError`.
+**Reintentos ante `429`.** La espera es la de la cabecera `Retry-After` si Binance la manda
+(su número gana sobre nuestro cálculo); si no, backoff exponencial `1 s, 2 s, 4 s, 8 s`.
+Tras el quinto intento fallido no se espera más y se lanza `RuntimeError`.
 
-**Pendiente:** ante un `418` la ingesta debería detenerse en vez de reintentar, porque cada
-petición durante un baneo lo prolonga (escala de 2 min a 3 días).
+**`418` corta la ingesta.** Cada petición durante un baneo lo prolonga (escala de 2 min a
+3 días), así que `fetch_klines` no reintenta: lanza `RuntimeError` con el `Retry-After` en
+el mensaje y deja que decida quien llama (a mano hoy, Airflow en la fase 4).
+
+**Peso del worker.** `/api/v3/ticker/24hr` con un símbolo pesa 2; cada 2 s son ~60 de peso
+por minuto, el 1 % del límite.
+
+**Respuestas de `/api/ticker`** (lee de Redis, no de Binance):
+
+| Situación | Respuesta |
+|---|---|
+| La clave existe | `200` con `Ticker` |
+| La clave no existe (expiró o nunca se escribió) | `503` `No recent ticker for <SYMBOL>` |
+| Redis caído | Excepción de `redis` → `500` |
 
 ### Limitaciones actuales (declaradas a propósito)
 
-1. **La ingesta no corre sola.** Hay que ejecutarla a mano (ver §5). Airflow la orquestará
-   en la fase 4.
-2. **El refresco es polling REST cada 10 s.** Aceptable para una sola pestaña; es justo lo
-   que la fase 3 sustituye por WebSocket → Redis Pub/Sub.
-3. **Cliente HTTP nuevo en cada llamada.** `_binance_get` abre un `AsyncClient` por request
-   y `fetch_klines` un `Client` por página del backfill. Sin reutilización de conexiones;
-   suficiente con este volumen.
-4. **El ticker no tiene caché.** Cada pestaña abierta multiplica las llamadas a Binance.
-5. **El frontend pide `limit=2` en cada refresco** para cubrir el cruce de minuto: si entre
+1. **La ingesta de velas no corre sola.** Hay que ejecutarla a mano (ver §6). Airflow la
+   orquestará en la fase 4.
+2. **El worker hace polling REST a Binance cada 2 s**, en contra de la regla "WebSocket
+   para tiempo real". Es un paso intermedio aceptado: la fase 3b lo sustituye por el
+   WebSocket de Binance → Redis Pub/Sub → WebSocket de FastAPI.
+3. **El navegador también hace polling** (ticker cada 2 s, velas cada 10 s). Lo resuelve
+   la misma fase 3b.
+4. **El worker sigue un solo símbolo** (`BTCUSDT`). Pedir otro a `/api/ticker` da `503`.
+5. **`fetch_klines` abre un `httpx.Client` por página** del backfill. Sin reutilización de
+   conexiones; suficiente con este volumen. El worker, en cambio, reutiliza un solo cliente.
+6. **El frontend pide `limit=2` en cada refresco** para cubrir el cruce de minuto: si entre
    dos refrescos se cierra una vela, la anterior llega completa y la nueva empieza.
-6. **La ingesta usa `print`**, no `logging`.
+7. **La ingesta y el worker usan `print`**, no `logging`.
 
 ---
 
-## 5. Puesta en marcha
+## 6. Puesta en marcha
 
 Requisitos: Docker con Compose v2, `make` y Node `^20.19` o `>=22.12` (lo exige Vite 8).
 
@@ -253,16 +334,28 @@ propios. Los guardas `${VAR:?falta en .env}` convierten ese error en un fallo vi
 
 | Comando | Qué hace |
 |---|---|
-| `make up` | Levanta `postgres` y `backend` en segundo plano |
+| `make up` | Levanta `postgres`, `redis`, `backend` y `worker` en segundo plano |
 | `make down` | Apaga el proyecto (los volúmenes se conservan) |
 | `make restart` | `down` + `up` |
 | `make logs` | Logs de todos los servicios en vivo |
 | `make psql` | Consola `psql` dentro del contenedor de Postgres |
+| `make redis` | Consola `redis-cli` dentro del contenedor de Redis |
 | `make migrate` | `alembic upgrade head` dentro del contenedor `backend` |
 | `make revision m="mensaje"` | Genera una migración con `--autogenerate` |
 
 `make up` **no reconstruye** la imagen del backend. Después de cambiar
-`backend/requirements.txt` o el `Dockerfile`: `docker compose up -d --build backend`.
+`backend/requirements.txt` o el `Dockerfile`, reconstruir los dos servicios que la usan:
+`docker compose up -d --build backend worker`.
+
+Para ver el worker y la clave en Redis:
+
+```bash
+docker compose logs -f worker     # errores y esperas del worker
+make redis                        # y dentro: GET ticker:BTCUSDT  /  TTL ticker:BTCUSDT
+```
+
+Redis no tiene volumen ni puerto publicado: solo guarda datos efímeros y se usa desde la
+red de Compose (`redis:6379`).
 
 Alembic corre **dentro** del contenedor porque `DATABASE_URL` apunta a `postgres:5432`, el
 nombre del servicio en la red de Compose. Desde el host, Postgres se expone en
@@ -299,7 +392,8 @@ npm run dev
 
 La app queda en `http://localhost:5173`; la documentación interactiva de la API en
 `http://localhost:8000/docs`. El backend monta `../backend` como volumen y arranca con
-`--reload`, así que los cambios en Python se aplican sin reconstruir la imagen.
+`--reload`, así que los cambios en Python se aplican sin reconstruir la imagen. El
+`worker` monta el mismo volumen pero **no** recarga solo: `docker compose restart worker`.
 
 ### Variables de entorno
 
@@ -312,10 +406,11 @@ La app queda en `http://localhost:5173`; la documentación interactiva de la API
 | `BINANCE_REST_URL` | Base de la API REST de Binance |
 | `BACKEND_PORT` | Puerto publicado del backend |
 | `CORS_ORIGINS` | Orígenes permitidos, separados por coma |
+| `REDIS_URL` | Conexión a Redis para la API y el worker (`redis://redis:6379/0`) |
 
 ---
 
-## 6. Recorrido de una vela hasta el gráfico
+## 7. Recorrido de una vela hasta el gráfico
 
 **a) La ingesta pide velas a Binance**, que responde con un array de arrays:
 
@@ -372,16 +467,24 @@ GET /api/klines?symbol=BTCUSDT&interval=1m&limit=500
 > dibuja números y la precisión que se pierde no es visible en pantalla. El `Decimal` importa
 > donde se **guarda**, no donde se pinta.
 
-**f) Ticker** (sin base de datos):
+**f) Ticker** (Redis, sin Postgres). Lo que guarda el worker:
+
+```
+ticker:BTCUSDT  (TTL 10 s)
+{"symbol": "BTCUSDT", "last_price": "65020.40000000", "price_change_percent": "1.234"}
+```
+
+Lo que responde la API (Pydantic convierte los strings a `float`):
 
 ```
 GET /api/ticker?symbol=BTCUSDT
-→ {"symbol":"BTCUSDT","last_price":65020.4,"price_change_percent":1.234}
+→ 200 {"symbol":"BTCUSDT","last_price":65020.4,"price_change_percent":1.234}
+→ 503 {"detail":"No recent ticker for BTCUSDT"}   # si la clave expiró
 ```
 
 ---
 
-## 7. Plan por fases
+## 8. Plan por fases
 
 Cada fase queda funcionando de punta a punta antes de pasar a la siguiente.
 
@@ -389,15 +492,15 @@ Cada fase queda funcionando de punta a punta antes de pasar a la siguiente.
 |---|---|---|
 | 0 — Andamiaje | Monorepo, Compose con Postgres, `/health`, CORS, variables de entorno | ✅ |
 | 1 — Rebanada vertical | Proxy a klines y ticker, velas en React con refresco de 10 s | ✅ |
-| 2 — PostgreSQL | Tabla `candles` ✅, upsert idempotente ✅, backfill paginado ✅, API lee de Postgres ✅ | 🚧 |
-| 3 — Redis y tiempo real | 3a: polling a Redis con TTL (cache-aside). 3b: WebSocket de Binance → Pub/Sub → WebSocket de FastAPI | ⏳ |
+| 2 — PostgreSQL | Tabla `candles` ✅, upsert idempotente ✅, backfill paginado ✅, API lee de Postgres ✅, `418` corta la ingesta ✅. Falta registrar la prueba del backfill | 🚧 |
+| 3 — Redis y tiempo real | 3a: worker escribe el ticker en Redis con TTL, la API solo lee ✅. 3b: WebSocket de Binance → Pub/Sub → WebSocket de FastAPI ⏳ | 🚧 |
 | 4 — Airflow | Ingesta periódica: DAG incremental diario y DAG de backfill con `catchup=True` (ZIP de `data.binance.vision`) | ⏳ |
 | 5 — MongoDB | Snapshots de order book y alertas/watchlists, con justificación frente a Postgres | ⏳ |
 | 6 — Proyecto real | pytest, JWT, CI en GitHub Actions, Prometheus + Grafana, deploy | ⏳ |
 
 ---
 
-## 8. Convenciones y supuestos
+## 9. Convenciones y supuestos
 
 - **Timestamps siempre UTC.** `TIMESTAMPTZ` en Postgres; segundos UNIX (UTC) hacia el
   navegador. La conversión a hora local es responsabilidad de la capa de presentación.
@@ -408,8 +511,11 @@ Cada fase queda funcionando de punta a punta antes de pasar a la siguiente.
   tarea de Airflow no se puede testear ni reutilizar.
 - **Secretos en `.env`** (en `.gitignore`); `.env.example` está versionado.
 - Explicaciones y documentación en español; código y nombres en inglés.
-- Un solo símbolo por defecto (`BTCUSDT`) e intervalo `1m`. Los endpoints aceptan otros
-  valores, pero el frontend todavía no ofrece selector.
+- **La API no llama a Binance.** Lee de Postgres (velas) o de Redis (ticker); hablar con
+  Binance es trabajo de la ingesta y del worker.
+- Un solo símbolo por defecto (`BTCUSDT`) e intervalo `1m`. `/api/klines` acepta otros
+  valores; `/api/ticker` solo tiene datos para el símbolo que sigue el worker. El frontend
+  todavía no ofrece selector.
 
 ### Registro de decisiones
 
@@ -419,7 +525,12 @@ Cada fase queda funcionando de punta a punta antes de pasar a la siguiente.
 | WebSocket para tiempo real, REST solo para históricos | Binance banea el polling agresivo |
 | lightweight-charts en vez de Recharts | Hecha para velas; evita pelear con ejes de tiempo |
 | Proxy de Vite para `/api` | URLs relativas en el front y sin CORS en desarrollo |
-| Propagar el status de Binance | Un `429`/`418` disfrazado de `500` oculta el problema real |
+| Ticker: un worker escribe en Redis, la API solo lee | Las llamadas a Binance no crecen con los usuarios; la API no depende de la latencia de Binance |
+| TTL de 10 s con escrituras cada 2 s | Tolera un par de fallos; si el worker muere, la clave expira y la API da `503` en vez de un precio viejo |
+| `503` sin clave, y el frontend marca `stale` | Un precio viejo mostrado como actual es peor que avisar que está viejo |
+| Formato propio en Redis, no el JSON de Binance | Cambiar la fuente en la fase 3b no toca la API ni el frontend |
+| Worker como servicio de Compose con la imagen del backend | Reutiliza código y dependencias; `restart: unless-stopped` lo mantiene vivo |
+| `418` corta la ingesta de velas | Reintentar durante un baneo lo alarga; decide quien llama |
 | PK compuesta natural en `candles` | Es la identidad de la vela y el objetivo del `ON CONFLICT` |
 | `NUMERIC` para precios | Evita perder precisión en cripto de bajo valor |
 | Esquema de la API `CandleOut`, modelo de la base `Candle` | Evita el choque de nombres entre Pydantic y SQLAlchemy al importar ambos |
