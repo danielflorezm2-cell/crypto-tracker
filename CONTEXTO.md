@@ -10,7 +10,7 @@ releer todo el código.
 - La documentación estable (arquitectura, puesta en marcha, convenciones, registro de
   decisiones) vive en [`README.md`](README.md). Aquí no se duplica, solo se enlaza.
 
-> **Última actualización:** 2026-09-26
+> **Última actualización:** 2026-09-27
 
 ---
 
@@ -26,8 +26,9 @@ Por eso se prefiere el código mínimo que resuelve la fase actual, sin abstracc
 
 ## 2. Fase actual
 
-**Fase 3a — ticker vía Redis** (✅ implementada). La fase 2 queda abierta solo por la
-prueba del backfill. Plan completo en `README.md` §8; detalle de Redis en §4.
+**Fase 3a — ticker vía Redis** (✅ implementada). La fase 2 está cerrada: el backfill se
+probó contra Binance real el 2026-09-27 (detalle en `BITACORA.md`). Sigue la fase 3b. Plan
+completo en `README.md` §8; detalle de Redis en §4.
 
 | Pieza | Estado | Dónde |
 |---|---|---|
@@ -36,7 +37,7 @@ prueba del backfill. Plan completo en `README.md` §8; detalle de Redis en §4.
 | `fetch_klines`: reintenta `429` (respeta `Retry-After`), corta con `RuntimeError` ante `418` | ✅ | `backend/app/ingest/candles.py` |
 | `upsert_candles` con `ON CONFLICT DO UPDATE` | ✅ | `backend/app/ingest/candles.py` |
 | `ingest_latest` (descarta la vela en curso) | ✅ | `backend/app/ingest/candles.py` |
-| `backfill` paginando hacia atrás con `endTime` | ✅ código, ❓ prueba sin registrar | `backend/app/ingest/candles.py` |
+| `backfill` paginando hacia atrás con `endTime` | ✅ probado contra Binance real | `backend/app/ingest/candles.py` |
 | `/api/klines` lee de Postgres (sync) | ✅ | `backend/app/api/market.py` |
 | Servicio `redis` (redis:7, con healthcheck, sin volumen ni puerto publicado) | ✅ | `infra/docker-compose.yml` |
 | Cliente de Redis por proceso + `ticker_key` | ✅ | `backend/app/db/cache.py` |
@@ -49,11 +50,10 @@ prueba del backfill. Plan completo en `README.md` §8; detalle de Redis en §4.
 
 ## 3. Pendientes inmediatos
 
-1. **Cerrar la fase 2:** probar el backfill y dejarlo anotado en la bitácora.
-2. **Fase 3b:** WebSocket de Binance en el worker → Redis Pub/Sub → WebSocket de FastAPI →
+1. **Fase 3b:** WebSocket de Binance en el worker → Redis Pub/Sub → WebSocket de FastAPI →
    navegador, para dejar el polling. El formato propio del valor en Redis está pensado para
    que ese cambio no toque la API.
-3. **La ingesta periódica de velas no es de esta fase.** Se corre a mano a propósito; la
+2. **La ingesta periódica de velas no es de esta fase.** Se corre a mano a propósito; la
    automatiza Airflow en la fase 4, sin mecanismo provisional. Mientras tanto, el refresco
    de 10 s del gráfico solo muestra velas nuevas si se ingirió a mano entre refresco y
    refresco.
@@ -95,6 +95,9 @@ Ejecutar la ingesta de velas a mano (desde la raíz del repo; `interval` por def
 docker compose exec backend python -c \
   "from app.ingest.candles import ingest_latest; print(ingest_latest(interval='1m'))"
 ```
+
+Comprobar que una carga de velas quedó completa e idempotente: consultas en `README.md` §6
+("Comprobar una carga").
 
 Comprobar el ticker: `docker compose logs -f worker` y `make redis` → `GET ticker:BTCUSDT`
 / `TTL ticker:BTCUSDT`.

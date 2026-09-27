@@ -193,3 +193,30 @@ carpeta). Regenerado, el HTML queda idéntico al versionado.
 **Decisiones:** `docs/api.html` pasa a ser un archivo generado: los cambios se hacen en el
 script y se regenera con `python3 docs/gen_api_html.py`. Las coordenadas de los diagramas
 viven en las funciones `c4_*` y el contenido de las secuencias en `seq_*`.
+
+### 2026-09-27 — Backfill probado: cierre de la fase 2
+
+**Hecho:** Prueba de `backfill` sin cambios en el código, en dos partes. Primero contra
+PostgreSQL 16 con la migración de Alembic y un Binance simulado (`/api/v3/klines` con límite
+de 1000, `endTime`, vela en curso, fecha de listado, huecos, `429` y `418`): 35 chequeos OK
+(paginación sin huecos, bordes de página, `start` naive, no alineado al minuto, anterior al
+listado o en el futuro, idempotencia, `429` respetando `Retry-After`, `418` que corta y
+reanudación sin duplicar). Después contra Binance real en Docker:
+`backfill('BTCUSDT', '1m', 2026-09-24 00:00 UTC)` devolvió 5617, exactamente los minutos
+entre `start` y la vela en curso (21:37 UTC), en 6 páginas. Re-ejecutado 20 min después
+devolvió 5637, y la ventana `2026-09-24 00:00` → `2026-09-27 21:36` quedó con 5617 filas y la
+misma huella md5 (`0b25a252…`) antes y después. README con las consultas de comprobación
+(§6, "Comprobar una carga"); README, CONTEXTO y esta bitácora al día.
+**Aprendido:** El número que devuelve `backfill` cuenta filas enviadas al upsert, no
+insertadas: prueba que la paginación recorrió todo, no la idempotencia. La idempotencia se
+comprueba en la tabla con una huella sobre una ventana fija, porque el total sube entre
+corridas a medida que cierran velas. La huella no cambia porque una vela cerrada en Binance
+no cambia: el `DO UPDATE` reescribe los mismos valores. Si se guardara la vela en curso, la
+re-ejecución la modificaría; la idempotencia sale de las dos reglas juntas (PK + upsert, y
+nunca la vela en curso). Que el conteo real cuadrara con los minutos transcurridos confirma
+lo que el simulador solo suponía: con solo `endTime`, Binance devuelve las `limit` velas más
+recientes anteriores a esa fecha; si no fuera así, el backfill habría guardado una página y
+terminado sin error. `TIMESTAMPTZ` se muestra en la zona horaria de la sesión: con
+`America/Bogota`, la vela de 00:00 UTC aparece como 19:00 del día anterior, y es el mismo
+instante.
+**Siguiente:** Fase 3b (WebSocket de Binance → Redis Pub/Sub → WebSocket de FastAPI).

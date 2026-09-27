@@ -11,11 +11,10 @@ Por eso el código busca ser el mínimo que resuelve la fase actual, sin capas n
 "por si acaso".
 
 > **Estado:** fase 3a (ticker vía Redis) implementada. Un worker consulta el ticker de
-> Binance cada 2 s y lo guarda en Redis con TTL; `/api/ticker` solo lee de Redis. De la
-> fase 2 están la tabla `candles`, el upsert idempotente, el backfill paginado y
-> `/api/klines` leyendo de Postgres; falta dejar registrada la prueba del backfill para
-> cerrarla. La ingesta de velas se corre a mano a propósito: ejecutarla de forma periódica
-> es trabajo de Airflow en la fase 4.
+> Binance cada 2 s y lo guarda en Redis con TTL; `/api/ticker` solo lee de Redis. La
+> fase 2 está cerrada: tabla `candles`, upsert idempotente, backfill paginado (probado
+> contra Binance real) y `/api/klines` leyendo de Postgres. La ingesta de velas se corre a
+> mano a propósito: ejecutarla de forma periódica es trabajo de Airflow en la fase 4.
 
 **Documentos de trabajo**
 
@@ -382,6 +381,41 @@ El gráfico pide `interval="1m"` (fijo en `App.jsx`). Para ver `5m` o `15m` hay 
 ese intervalo (`ingest_latest(interval='5m')`) y cambiar el prop; si no, se ve el aviso de
 tabla vacía.
 
+### Comprobar una carga
+
+El número que imprimen `ingest_latest` y `backfill` son filas **enviadas** al upsert, no
+insertadas: re-ejecutar devuelve lo mismo aunque no entre nada nuevo. Lo que prueba la
+carga es la tabla (`make psql`; ajustar símbolo y fechas):
+
+```sql
+-- Completitud: velas = esperadas si no hay huecos; sin_vela_en_curso debe ser t
+SELECT count(*) AS velas,
+       (extract(epoch FROM max(open_time) - min(open_time)) / 60 + 1)::int AS esperadas,
+       min(open_time) AS primera, max(open_time) AS ultima,
+       max(open_time) < date_trunc('minute', now()) AS sin_vela_en_curso
+FROM candles
+WHERE symbol = 'BTCUSDT' AND interval = '1m' AND open_time >= '2026-09-24 00:00+00';
+
+-- Si velas < esperadas: dónde están los huecos
+SELECT open_time, next_open - open_time AS salto
+FROM (SELECT open_time, lead(open_time) OVER (ORDER BY open_time) AS next_open
+      FROM candles
+      WHERE symbol = 'BTCUSDT' AND interval = '1m' AND open_time >= '2026-09-24 00:00+00') t
+WHERE next_open - open_time <> interval '1 minute';
+
+-- Idempotencia: huella de una ventana FIJA ya cerrada; correr, re-ejecutar la ingesta y
+-- volver a correr. count y huella deben salir iguales.
+SELECT count(*), md5(string_agg(open_time::text || open || high || low || close || volume,
+                                ',' ORDER BY open_time)) AS huella
+FROM candles
+WHERE symbol = 'BTCUSDT' AND interval = '1m'
+  AND open_time BETWEEN '2026-09-24 00:00+00' AND '2026-09-27 21:36+00';
+```
+
+La consulta de esperadas supone `1m`; para otro intervalo, cambiar el `/ 60` y el
+`interval '1 minute'`. La huella se toma sobre una ventana fija porque el conteo total sube
+entre corridas: cierran velas nuevas.
+
 ### Frontend
 
 ```bash
@@ -492,7 +526,7 @@ Cada fase queda funcionando de punta a punta antes de pasar a la siguiente.
 |---|---|---|
 | 0 — Andamiaje | Monorepo, Compose con Postgres, `/health`, CORS, variables de entorno | ✅ |
 | 1 — Rebanada vertical | Proxy a klines y ticker, velas en React con refresco de 10 s | ✅ |
-| 2 — PostgreSQL | Tabla `candles` ✅, upsert idempotente ✅, backfill paginado ✅, API lee de Postgres ✅, `418` corta la ingesta ✅. Falta registrar la prueba del backfill | 🚧 |
+| 2 — PostgreSQL | Tabla `candles` ✅, upsert idempotente ✅, backfill paginado y probado contra Binance real ✅, API lee de Postgres ✅, `418` corta la ingesta ✅ | ✅ |
 | 3 — Redis y tiempo real | 3a: worker escribe el ticker en Redis con TTL, la API solo lee ✅. 3b: WebSocket de Binance → Pub/Sub → WebSocket de FastAPI ⏳ | 🚧 |
 | 4 — Airflow | Ingesta periódica: DAG incremental diario y DAG de backfill con `catchup=True` (ZIP de `data.binance.vision`) | ⏳ |
 | 5 — MongoDB | Snapshots de order book y alertas/watchlists, con justificación frente a Postgres | ⏳ |
