@@ -11,10 +11,12 @@ from app.db.session import SessionLocal
 
 router = APIRouter(prefix="/api", tags=["market"])
 
-
 @router.get("/ticker", response_model=Ticker)
 def get_ticker(symbol: str = "BTCUSDT"):
-    raw = cache.get(ticker_key(symbol))
+    try:
+        raw = cache.get(ticker_key(symbol))
+    except redis.RedisError as exc:
+        raise HTTPException(status_code=503, detail="") from exc
     # Sin clave: el worker está caído, atrasado o no sigue este símbolo
     if raw is None:
         raise HTTPException(status_code=503, detail=f"No recent ticker for {symbol}")
@@ -47,4 +49,4 @@ def get_klines(
                 volume=float(c.volume),
             )
             for c in reversed(candles)
-        ]
+        ]   
