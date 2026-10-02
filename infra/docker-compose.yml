@@ -29,6 +29,7 @@ services:
     environment:
       CORS_ORIGINS: ${CORS_ORIGINS:?falta en .env}
       BINANCE_REST_URL: ${BINANCE_REST_URL:?falta en .env}
+      BINANCE_WS_URL: ${BINANCE_WS_URL:?falta en .env}
       DATABASE_URL: ${DATABASE_URL:?falta en .env}
       REDIS_URL: ${REDIS_URL:?falta en .env}
     ports:
@@ -49,6 +50,7 @@ services:
     environment:
       BINANCE_REST_URL: ${BINANCE_REST_URL:?falta en .env}
       REDIS_URL: ${REDIS_URL:?falta en .env}
+      BINANCE_WS_URL: ${BINANCE_WS_URL:?falta en .env}
       # El worker no usa Postgres, pero Settings exige database_url al importarse
       DATABASE_URL: ${DATABASE_URL:?falta en .env}
     volumes:

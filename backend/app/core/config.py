@@ -6,6 +6,7 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:5173"
     binance_rest_url: str = "https://data-api.binance.vision"
     binance_api_key: str = ""
+    binance_ws_url: str = "wss://data-stream.binance.vision"
     database_url: str
     redis_url: str
     @property
